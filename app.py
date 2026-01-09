@@ -3,18 +3,19 @@
 # ============================================================
 import pandas as pd
 import streamlit as st
-
-from datetime import datetime
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
 
+# Inicializa o banco de dados na primeira execução
 init_db()
 
+# Configurações da página
 st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide")
 
 def render_upload_section():
+    """Interface de upload e processamento de arquivos."""
     st.title("📂 Processamento de Documentos")
-    st.write("Suba suas planilhas para extração automática.")
+    st.write("Suba suas planilhas para extração automática e salvamento no banco.")
     
     arquivos = st.file_uploader(
         "Selecione arquivos (.xlsx, .csv)",
@@ -26,83 +27,100 @@ def render_upload_section():
         dfs = []
         for arq in arquivos:
             df, erro = processar_planilha(arq)
-            if not erro: dfs.append(df)
-            else: st.error(f"Erro em {arq.name}: {erro}")
+            if not erro: 
+                dfs.append(df)
+            else: 
+                st.error(f"Erro em {arq.name}: {erro}")
 
         if dfs:
             df_final = pd.concat(dfs, ignore_index=True)
             st.subheader("📋 Preview dos Dados")
-            df_editado = st.data_editor(df_final, use_container_width=True, num_rows="dynamic")
+            st.info("Revise os dados abaixo antes de confirmar o salvamento.")
+            
+            # ATUALIZAÇÃO: Alterado de use_container_width=True para width="stretch"
+            df_editado = st.data_editor(
+                df_final, 
+                width="stretch", 
+                num_rows="dynamic"
+            )
             
             if st.button("💾 Confirmar e Salvar no Banco"):
-                with st.spinner("Analisando duplicatas e salvando..."):
-                    # Sanitização
+                with st.spinner("Processando registros..."):
                     df_salvar = df_editado.dropna(subset=['data', 'valor', 'descricao']).copy()
                     
                     if not df_salvar.empty:
                         try:
-                            # Normalização de data para o SQLite
                             df_salvar['data'] = pd.to_datetime(df_salvar['data']).dt.strftime('%Y-%m-%d')
-                            
-                            # Execução da persistência inteligente
                             novos = insert_transactions(df_salvar)
                             
                             if novos > 0:
-                                st.success(f"Excelente! {novos} novos registros foram adicionados.")
+                                st.success(f"Sucesso! {novos} novos registros foram adicionados.")
                                 st.balloons()
                             else:
-                                st.warning("Nenhum dado novo. Todos os registros já existiam no banco.")
+                                st.warning("Nenhum dado novo detectado (registros duplicados ignorados).")
                             
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Falha na persistência: {e}")
+                            st.error(f"Erro ao salvar: {e}")
                     else:
                         st.warning("Não há dados válidos para salvar.")
-    
-    
-# --- 3. SEÇÃO DE HISTÓRICO ---
+
 def render_history_section():
+    """Interface de Histórico (Task MN2512-7)."""
     st.title("📜 Histórico de Transações")
-    st.write("Aqui estão todos os dados armazenados no seu banco de dados local.")
+    st.write("Visualize e valide todos os registros já processados no sistema.")
     
-    # Busca dados do SQLite
     df_historico = get_all_transactions()
     
-    if not df_historico.empty:
-        # Métricas rápidas para dar um ar profissional ao MVP
-        total_gasto = df_historico['valor'].sum()
-        qtd_transacoes = len(df_historico)
-        
-        col1, col2 = st.columns(2)
-        col1.metric("Total Acumulado", f"R$ {total_gasto:,.2f}")
-        col2.metric("Nº de Registros", qtd_transacoes)
-        
-        st.markdown("---")
-        # Exibe a tabela do banco
-        st.dataframe(df_historico, use_container_width=True)
-        
-        # Botão para baixar o que está no banco (opcional, mas útil)
-        csv = df_historico.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Baixar Tudo em CSV", csv, "historico_financeiro.csv", "text/csv")
-    else:
-        st.warning("O banco de dados ainda está vazio. Vá para a aba 'Início' e faça um upload!")
+    if df_historico.empty:
+        st.info("💡 Nenhum registro encontrado. Vá até a aba **Início** para subir seus arquivos!")
+        return
 
-# --- 4. NAVEGAÇÃO ---
+    # Tratamento de dados
+    df_historico['data'] = pd.to_datetime(df_historico['data'])
+    df_historico = df_historico.sort_values(by='data', ascending=False)
+
+    # ATUALIZAÇÃO: Alterado de use_container_width=True para width="stretch"
+    st.dataframe(
+        df_historico,
+        width="stretch",
+        hide_index=True,
+        column_order=("data", "descricao", "valor", "fonte", "categoria"),
+        column_config={
+            "data": st.column_config.DateColumn(
+                "Data da Transação",
+                format="DD/MM/YYYY"
+            ),
+            "valor": st.column_config.NumberColumn(
+                "Valor",
+                format="R$ %.2f"
+            ),
+            "descricao": "Descrição",
+            "fonte": "Origem do Arquivo",
+            "categoria": "Categoria"
+        }
+    )
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    total = df_historico['valor'].sum()
+    col1.metric("Volume Total Processado", f"R$ {total:,.2f}")
+    col2.metric("Total de Registros", len(df_historico))
+
+# --- NAVEGAÇÃO LATERAL ---
 with st.sidebar:
-    st.title("🚀 Extrator Pro v1.0")
+    st.title("🚀 Extrator Pro")
     st.markdown("---")
-    aba_selecionada = st.radio("Navegação", ["Início", "Histórico", "Configurações"])
+    aba_selecionada = st.radio(
+        "Navegação Principal", 
+        ["Início", "Histórico"],
+        index=0
+    )
     st.markdown("---")
-    st.caption("Desenvolvido com Tot 🤖")
+    st.caption("Especialista: Tot 🤖")
 
-# --- LÓGICA DE NAVEGAÇÃO ---
+# --- LÓGICA DE RENDERIZAÇÃO ---
 if aba_selecionada == "Início":
     render_upload_section()
-
 elif aba_selecionada == "Histórico":
     render_history_section()
-
-elif aba_selecionada == "Configurações":
-    st.title("⚙️ Configurações")
-    st.write("Configurações do Banco de Dados:")
-    st.code(f"DB Path: ./dados_financeiros.db")
