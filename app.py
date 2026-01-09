@@ -9,35 +9,44 @@ from planilhas import processar_planilha
 # Inicializa o banco de dados na primeira execução
 init_db()
 
-# Configurações da página
+# Configurações da página para uma interface profissional
 st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide")
 
 def render_upload_section():
-    """Interface de upload e processamento de arquivos."""
+    """Interface de upload e processamento de arquivos (Atualizada MN2512-16)."""
     st.title("📂 Processamento de Documentos")
-    st.write("Suba suas planilhas para extração automática e salvamento no banco.")
+    st.write("Suba seus arquivos para extração automática. O sistema agora suporta documentos e imagens!")
     
+    # MN2512-16: Atualização do filtro de extensões e label informativa
     arquivos = st.file_uploader(
-        "Selecione arquivos (.xlsx, .csv)",
-        type=["xlsx", "csv"], 
-        accept_multiple_files=True
+        "Formatos aceitos: XLSX, CSV, PDF, PNG, JPG, JPEG",
+        type=["xlsx", "csv", "pdf", "png", "jpg", "jpeg"], 
+        accept_multiple_files=True,
+        help="Arraste e solte seus comprovantes, faturas ou planilhas aqui."
     )
     
     if arquivos:
         dfs = []
         for arq in arquivos:
-            df, erro = processar_planilha(arq)
-            if not erro: 
-                dfs.append(df)
-            else: 
-                st.error(f"Erro em {arq.name}: {erro}")
+            # Identificação da extensão para lógica futura
+            extensao = arq.name.split('.')[-1].lower()
+            
+            if extensao in ['xlsx', 'csv']:
+                df, erro = processar_planilha(arq)
+                if not erro: 
+                    dfs.append(df)
+                else: 
+                    st.error(f"Erro em {arq.name}: {erro}")
+            else:
+                # Placeholder para as próximas tarefas da Milestone 2 (PDF e OCR)
+                st.warning(f"O arquivo '{arq.name}' foi aceito, mas o motor de extração para {extensao.upper()} será implementado nas próximas etapas (MN2512-14/MN2512-8).")
 
         if dfs:
             df_final = pd.concat(dfs, ignore_index=True)
             st.subheader("📋 Preview dos Dados")
-            st.info("Revise os dados abaixo antes de confirmar o salvamento.")
+            st.info("Revise os dados extraídos das planilhas abaixo.")
             
-            # ATUALIZAÇÃO: Alterado de use_container_width=True para width="stretch"
+            # Mantendo a correção de largura (width="stretch") para evitar warnings
             df_editado = st.data_editor(
                 df_final, 
                 width="stretch", 
@@ -45,7 +54,7 @@ def render_upload_section():
             )
             
             if st.button("💾 Confirmar e Salvar no Banco"):
-                with st.spinner("Processando registros..."):
+                with st.spinner("Persistindo dados no SQLite..."):
                     df_salvar = df_editado.dropna(subset=['data', 'valor', 'descricao']).copy()
                     
                     if not df_salvar.empty:
@@ -57,7 +66,7 @@ def render_upload_section():
                                 st.success(f"Sucesso! {novos} novos registros foram adicionados.")
                                 st.balloons()
                             else:
-                                st.warning("Nenhum dado novo detectado (registros duplicados ignorados).")
+                                st.warning("Nenhum dado novo detectado.")
                             
                             st.rerun()
                         except Exception as e:
@@ -66,7 +75,7 @@ def render_upload_section():
                         st.warning("Não há dados válidos para salvar.")
 
 def render_history_section():
-    """Interface de Histórico (Task MN2512-7)."""
+    """Interface de Histórico."""
     st.title("📜 Histórico de Transações")
     st.write("Visualize e valide todos os registros já processados no sistema.")
     
@@ -76,48 +85,27 @@ def render_history_section():
         st.info("💡 Nenhum registro encontrado. Vá até a aba **Início** para subir seus arquivos!")
         return
 
-    # Tratamento de dados
     df_historico['data'] = pd.to_datetime(df_historico['data'])
     df_historico = df_historico.sort_values(by='data', ascending=False)
 
-    # ATUALIZAÇÃO: Alterado de use_container_width=True para width="stretch"
     st.dataframe(
         df_historico,
         width="stretch",
         hide_index=True,
         column_order=("data", "descricao", "valor", "fonte", "categoria"),
         column_config={
-            "data": st.column_config.DateColumn(
-                "Data da Transação",
-                format="DD/MM/YYYY"
-            ),
-            "valor": st.column_config.NumberColumn(
-                "Valor",
-                format="R$ %.2f"
-            ),
-            "descricao": "Descrição",
-            "fonte": "Origem do Arquivo",
-            "categoria": "Categoria"
+            "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+            "valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
         }
     )
-
-    st.divider()
-    col1, col2 = st.columns(2)
-    total = df_historico['valor'].sum()
-    col1.metric("Volume Total Processado", f"R$ {total:,.2f}")
-    col2.metric("Total de Registros", len(df_historico))
 
 # --- NAVEGAÇÃO LATERAL ---
 with st.sidebar:
     st.title("🚀 Extrator Pro")
     st.markdown("---")
-    aba_selecionada = st.radio(
-        "Navegação Principal", 
-        ["Início", "Histórico"],
-        index=0
-    )
+    aba_selecionada = st.radio("Navegação", ["Início", "Histórico"])
     st.markdown("---")
-    st.caption("Especialista: Tot 🤖")
+    st.caption("Tot Assistente: Milestone 2 em curso 🧠")
 
 # --- LÓGICA DE RENDERIZAÇÃO ---
 if aba_selecionada == "Início":
