@@ -6,6 +6,7 @@ import streamlit as st
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
 from pdfs import extrair_texto_pdf
+from ocr import extrair_texto_imagem
 
 # Inicializa o banco de dados na primeira execução
 init_db()
@@ -53,7 +54,19 @@ def render_upload_section():
                         with st.expander(f"Ver texto bruto extraído - {arq.name}"):
                             st.text(texto)
                             st.info("Próxima etapa: O motor de Regex (MN2512-9) irá converter este texto em uma tabela.")
+            # --- FLUXO IMAGENS (MN2512-8) ---
+            elif extensao in ['png', 'jpg', 'jpeg']:
+                with st.spinner(f"Processando imagem: {arq.name}..."):
+                    texto, tempo, erro = extrair_texto_imagem(arq)
 
+                    if erro:
+                        st.error(f"Erro em {arq.name}: {erro}")
+                    else:
+                        st.success(f"Texto extraído em {tempo:.2f}s!")
+                        with st.expander(f"Ver texto bruto da imagem - {arq.name}"):
+                            st.text(texto)
+                            st.info("Próxima etapa: O motor de Regex (MN2512-9) irá converter este texto em uma tabela.")
+        
         # Exibição de resultados das planilhas (como já tínhamos)
         if dfs:
             df_final = pd.concat(dfs, ignore_index=True)
