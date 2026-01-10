@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
-from pdfs import extrair_texto_pdf
+from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
 
 # Inicializa o banco de dados na primeira execução
@@ -38,7 +38,7 @@ def render_upload_section():
                 else: 
                     st.error(f"Erro em {arq.name}: {erro}")
             
-            # --- FLUXO PDF (MN2512-14) ---
+            # --- FLUXO PDF (MN2512-14 e ) ---
             elif extensao == 'pdf':
                 with st.spinner(f"Lendo PDF: {arq.name}..."):
                     texto, is_scanned, erro = extrair_texto_pdf(arq)
@@ -46,14 +46,33 @@ def render_upload_section():
                     if erro:
                         st.error(f"Erro em {arq.name}: {erro}")
                     elif is_scanned:
-                        # Critério: Disparar fluxo de OCR futuramente
-                        st.warning(f"'{arq.name}' parece ser um PDF scaneado (imagem). O motor de OCR (MN2512-15) será necessário para ler este arquivo.")
+                        # --- INÍCIO DA TASK MN2512-15 ---
+                        st.warning(f"'{arq.name}' é um PDF scaneado. Iniciando pipeline de OCR...")
+                        
+                        texto_ocr_total = ""
+                        # Barra de progresso para múltiplas páginas
+                        progresso = st.progress(0)
+                        
+                        # Converte e processa cada página individualmente para poupar RAM
+                        imagens_paginas = list(converter_pdf_para_imagens(arq))
+                        total_pags = len(imagens_paginas)
+
+                        for i, img_buffer in enumerate(imagens_paginas):
+                            with st.spinner(f"Processando página {i+1} de {total_pags}..."):
+                                texto_pag, tempo, erro_ocr = extrair_texto_imagem(img_buffer)
+                                if not erro_ocr:
+                                    texto_ocr_total += texto_pag + "\n"
+                            progresso.progress((i + 1) / total_pags)
+                        
+                        st.success(f"Extração OCR concluída!")
+                        with st.expander(f"Ver texto extraído via OCR - {arq.name}"):
+                            st.text(texto_ocr_total)
+                            st.info("Próxima etapa: O motor de Regex (MN2512-9) irá converter este texto em uma tabela.")
+                        # --- FIM DA TASK MN2512-15 ---
                     else:
                         st.success(f"Texto extraído com sucesso de {arq.name}!")
-                        # Placeholder para MN2512-9 (Regex)
                         with st.expander(f"Ver texto bruto extraído - {arq.name}"):
                             st.text(texto)
-                            st.info("Próxima etapa: O motor de Regex (MN2512-9) irá converter este texto em uma tabela.")
             # --- FLUXO IMAGENS (MN2512-8) ---
             elif extensao in ['png', 'jpg', 'jpeg']:
                 with st.spinner(f"Processando imagem: {arq.name}..."):
