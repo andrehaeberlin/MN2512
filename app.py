@@ -6,151 +6,144 @@ from extrator_regex import extrair_dados_financeiros
 from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
 
-# Inicializa o banco de dados na primeira execução
+# Inicializa o banco de dados
 init_db()
 
 # Configurações da página
 st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide")
 
+# --- INICIALIZAÇÃO DO ESTADO (MN2512-10) ---
+if 'dados_para_revisar' not in st.session_state:
+    # Criamos um DataFrame vazio com as colunas padrão
+    st.session_state.dados_para_revisar = pd.DataFrame(columns=['data', 'valor', 'descricao'])
+
+def limpar_buffer():
+    """Limpa os dados da área de preview."""
+    st.session_state.dados_para_revisar = pd.DataFrame(columns=['data', 'valor', 'descricao'])
+    st.rerun()
+
 def render_upload_section():
-    """Interface de upload e processamento de arquivos."""
     st.title("📂 Processamento de Documentos")
-    st.write("O sistema aceita Planilhas, PDFs e Imagens para extração automática.")
     
+    # Upload de arquivos
     arquivos = st.file_uploader(
-        "Formatos aceitos: XLSX, CSV, PDF, PNG, JPG, JPEG",
+        "Arraste planilhas, PDFs ou imagens aqui",
         type=["xlsx", "csv", "pdf", "png", "jpg", "jpeg"], 
         accept_multiple_files=True
     )
     
     if arquivos:
-        dfs = []
-        for arq in arquivos:
-            extensao = arq.name.split('.')[-1].lower()
-            texto_total = ""
+        if st.button("🚀 Iniciar Processamento"):
+            novos_dados = []
             
-            # --- FLUXO PLANILHAS ---
-            if extensao in ['xlsx', 'csv']:
-                df_plan, erro = processar_planilha(arq)
-                if not erro: 
-                    # Garante colunas mínimas para o merge
-                    df_plan = df_plan[['data', 'valor', 'descricao']]
-                    dfs.append(df_plan)
-                else: 
-                    st.error(f"Erro em {arq.name}: {erro}")
-            
-            # --- FLUXO PDF (Nativo ou Scaneado) ---
-            elif extensao == 'pdf':
-                with st.spinner(f"Processando PDF: {arq.name}..."):
-                    texto_pdf, is_scanned, erro = extrair_texto_pdf(arq)
-                    
-                    if is_scanned:
-                        st.warning(f"'{arq.name}' é um PDF scaneado. Iniciando OCR por página...")
-                        for img_buffer in converter_pdf_para_imagens(arq):
-                            t, _, _ = extrair_texto_imagem(img_buffer)
-                            texto_total += t + "\n"
-                    else:
-                        texto_total = texto_pdf
-                    
-                    dados = extrair_dados_financeiros(texto_total)
-                    
-                    # Debug para ajudar a ajustar o Regex
-                    with st.expander(f"🔍 Debug PDF: {arq.name}"):
-                        c1, c2 = st.columns(2)
-                        c1.text_area("Texto Extraído", texto_total, height=200)
-                        c2.json(dados)
-                    
-                    dfs.append(pd.DataFrame([dados]))
-
-            # --- FLUXO IMAGENS ---
-            elif extensao in ['png', 'jpg', 'jpeg']:
-                with st.spinner(f"Processando imagem: {arq.name}..."):
-                    texto_img, _, erro = extrair_texto_imagem(arq)
-                    if not erro:
-                        dados = extrair_dados_financeiros(texto_img)
+            for arq in arquivos:
+                extensao = arq.name.split('.')[-1].lower()
+                
+                # 1. Processamento de Planilhas
+                if extensao in ['xlsx', 'csv']:
+                    with st.spinner(f"Processando planilha {arq.name}..."):
+                        df_plan, erro = processar_planilha(arq)
+                        if not erro:
+                            novos_dados.append(df_plan[['data', 'valor', 'descricao']])
+                
+                # 2. Processamento de PDFs e Imagens (OCR + Regex)
+                else:
+                    with st.spinner(f"Extraindo dados de {arq.name}..."):
+                        texto_total = ""
+                        if extensao == 'pdf':
+                            texto_pdf, is_scanned, _ = extrair_texto_pdf(arq)
+                            if is_scanned:
+                                for img_buffer in converter_pdf_para_imagens(arq):
+                                    t, _, _ = extrair_texto_imagem(img_buffer)
+                                    texto_total += t + "\n"
+                            else:
+                                texto_total = texto_pdf
+                        else:
+                            texto_total, _, _ = extrair_texto_imagem(arq)
                         
-                        # Debug para ajudar a ajustar o Regex
-                        with st.expander(f"🔍 Debug Imagem: {arq.name}"):
-                            c1, c2 = st.columns(2)
-                            c1.text_area("Texto do OCR", texto_img, height=200)
-                            c2.json(dados)
-                            
-                        dfs.append(pd.DataFrame([dados]))
-                    else:
-                        st.error(f"Erro no OCR de {arq.name}: {erro}")
+                        # Aplica inteligência de Regex (MN2512-9)
+                        dados_extraidos = extrair_dados_financeiros(texto_total)
+                        novos_dados.append(pd.DataFrame([dados_extraidos]))
+
+            # Consolida os novos dados no Session State para revisão
+            if novos_dados:
+                df_acumulado = pd.concat(novos_dados, ignore_index=True)
+                # Converte coluna data para formato datetime para o editor
+                df_acumulado['data'] = pd.to_datetime(df_acumulado['data'], errors='coerce')
+                
+                # Adiciona ao que já existia no buffer (permitindo múltiplos uploads)
+                st.session_state.dados_para_revisar = pd.concat(
+                    [st.session_state.dados_para_revisar, df_acumulado], 
+                    ignore_index=True
+                )
+                st.success(f"{len(df_acumulado)} item(ns) adicionado(s) para revisão!")
+
+    # --- SEÇÃO DE PREVIEW E CONFERÊNCIA (MN2512-10) ---
+    if not st.session_state.dados_para_revisar.empty:
+        st.divider()
+        st.subheader("📋 Preview de Conferência (Human-in-the-loop)")
+        st.info("Ajuste os dados abaixo antes de salvar permanentemente no banco de dados.")
+
+        # Componente principal: st.data_editor
+        # num_rows="dynamic" permite ao usuário excluir linhas erradas ou adicionar novas
+        df_editado = st.data_editor(
+            st.session_state.dados_para_revisar,
+            width="stretch",
+            num_rows="dynamic",
+            column_config={
+                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
+                "descricao": st.column_config.TextColumn("Descrição/Estabelecimento", width="large"),
+            }
+        )
+
+        col1, col2, _ = st.columns([1, 1, 2])
         
-        # Consolidação e Exibição
-        if dfs:
-            df_final = pd.concat(dfs, ignore_index=True)
-            
-            # Garantir que a coluna data seja interpretada corretamente para o editor
-            if 'data' in df_final.columns:
-                df_final['data'] = pd.to_datetime(df_final['data'], errors='coerce')
-
-            st.subheader("📋 Revisão dos Dados Extraídos")
-            st.info("💡 Verifique os campos abaixo. Você pode editar os valores diretamente na tabela.")
-            
-            df_editado = st.data_editor(
-                df_final, 
-                width="stretch", 
-                num_rows="dynamic",
-                column_config={
-                    "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-                    "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
-                }
-            )
-            
-            if st.button("💾 Confirmar e Salvar no Banco de Dados"):
-                with st.spinner("Salvando transações..."):
-                    # Limpa linhas totalmente vazias ou sem descrição
-                    df_salvar = df_editado.dropna(subset=['descricao']).copy()
+        with col1:
+            if st.button("💾 Confirmar e Salvar", type="primary"):
+                with st.spinner("Salvando..."):
+                    # Validação: Remove linhas onde a descrição está vazia
+                    df_final = df_editado.dropna(subset=['descricao']).copy()
                     
-                    if not df_salvar.empty:
-                        # Converte data para string YYYY-MM-DD para o SQLite
-                        df_salvar['data'] = df_salvar['data'].dt.strftime('%Y-%m-%d')
-                        # Garante que valores nulos em 'valor' virem 0.0
-                        df_salvar['valor'] = df_salvar['valor'].fillna(0.0)
+                    if not df_final.empty:
+                        # Normaliza datas para string antes do SQLite
+                        df_final['data'] = pd.to_datetime(df_final['data']).dt.strftime('%Y-%m-%d')
+                        df_final['valor'] = df_final['valor'].fillna(0.0)
                         
-                        insert_transactions(df_salvar)
-                        st.success(f"Sucesso! {len(df_salvar)} registros salvos.")
-                        st.balloons()
-                        st.rerun()
+                        insert_transactions(df_final)
+                        st.success("✅ Dados persistidos com sucesso!")
+                        limpar_buffer() # Limpa após sucesso
                     else:
-                        st.warning("Nenhum dado válido para salvar.")
+                        st.warning("Não há dados válidos para salvar.")
+        
+        with col2:
+            if st.button("🗑️ Descartar Tudo"):
+                limpar_buffer()
 
 def render_history_section():
-    """Interface de Histórico."""
     st.title("📜 Histórico de Transações")
     df_historico = get_all_transactions()
     
-    if df_historico.empty:
-        st.info("💡 Nenhum registro encontrado no banco de dados.")
-        return
+    if not df_historico.empty:
+        df_historico['data'] = pd.to_datetime(df_historico['data'])
+        st.dataframe(
+            df_historico.sort_values('data', ascending=False),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
+            }
+        )
+    else:
+        st.info("Nenhum registro encontrado.")
 
-    # Tratamento para exibição
-    df_historico['data'] = pd.to_datetime(df_historico['data'])
-    df_historico = df_historico.sort_values(by='data', ascending=False)
-
-    st.dataframe(
-        df_historico,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-            "valor": st.column_config.NumberColumn("Valor", format="R$ %.2f"),
-        }
-    )
-
-# --- NAVEGAÇÃO LATERAL ---
+# --- NAVEGAÇÃO ---
 with st.sidebar:
     st.title("🚀 Extrator Pro")
-    aba_selecionada = st.radio("Navegação", ["Início", "Histórico"])
-    st.divider()
-    st.caption("Fase: Milestone 2 - Cérebro 🧠")
-    st.info("O sistema utiliza OCR e Regex para identificar padrões financeiros automaticamente.")
+    aba = st.radio("Navegação", ["Início", "Histórico"])
 
-# --- LÓGICA DE RENDERIZAÇÃO ---
-if aba_selecionada == "Início":
+if aba == "Início":
     render_upload_section()
-elif aba_selecionada == "Histórico":
+else:
     render_history_section()
