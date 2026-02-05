@@ -5,6 +5,7 @@ from planilhas import processar_planilha
 from extrator_regex import extrair_dados_financeiros
 from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
+import datetime
 
 # Inicializa o banco de dados
 init_db()
@@ -12,20 +13,18 @@ init_db()
 # Configurações da página
 st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide")
 
-# --- INICIALIZAÇÃO DO ESTADO (MN2512-10) ---
+# --- INICIALIZAÇÃO DO ESTADO ---
 if 'dados_para_revisar' not in st.session_state:
-    # Criamos um DataFrame vazio com as colunas padrão
     st.session_state.dados_para_revisar = pd.DataFrame(columns=['data', 'valor', 'descricao'])
 
 def limpar_buffer():
-    """Limpa os dados da área de preview."""
+    """Limpa os dados da área de preview e recarrega a página."""
     st.session_state.dados_para_revisar = pd.DataFrame(columns=['data', 'valor', 'descricao'])
     st.rerun()
 
 def render_upload_section():
     st.title("📂 Processamento de Documentos")
     
-    # Upload de arquivos
     arquivos = st.file_uploader(
         "Arraste planilhas, PDFs ou imagens aqui",
         type=["xlsx", "csv", "pdf", "png", "jpg", "jpeg"], 
@@ -61,38 +60,44 @@ def render_upload_section():
                         else:
                             texto_total, _, _ = extrair_texto_imagem(arq)
                         
-                        # Aplica inteligência de Regex (MN2512-9)
+                        # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
-                        novos_dados.append(pd.DataFrame([dados_extraidos]))
+                        
+                        # Correção Crítica: Verificamos se há dados e criamos o DF sem colchetes extras
+                        if dados_extraidos:
+                            df_temp = pd.DataFrame(dados_extraidos)
+                            novos_dados.append(df_temp)
 
-            # Consolida os novos dados no Session State para revisão
+            # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
-                # Converte coluna data para formato datetime para o editor
-                df_acumulado['data'] = pd.to_datetime(df_acumulado['data'], errors='coerce')
                 
-                # Adiciona ao que já existia no buffer (permitindo múltiplos uploads)
+                # Conversão robusta de tipos
+                df_acumulado['data'] = pd.to_datetime(df_acumulado['data'], errors='coerce')
+                df_acumulado['valor'] = pd.to_numeric(df_acumulado['valor'], errors='coerce')
+                
                 st.session_state.dados_para_revisar = pd.concat(
                     [st.session_state.dados_para_revisar, df_acumulado], 
                     ignore_index=True
                 )
                 st.success(f"{len(df_acumulado)} item(ns) adicionado(s) para revisão!")
+            else:
+                st.warning("Nenhum dado financeiro foi identificado nos arquivos.")
 
-    # --- SEÇÃO DE PREVIEW E CONFERÊNCIA (MN2512-10) ---
+    # --- SEÇÃO DE PREVIEW E CONFERÊNCIA ---
     if not st.session_state.dados_para_revisar.empty:
         st.divider()
-        st.subheader("📋 Preview de Conferência (Human-in-the-loop)")
-        st.info("Ajuste os dados abaixo antes de salvar permanentemente no banco de dados.")
+        st.subheader("📋 Preview de Conferência (Validação)")
+        st.info("Verifique os dados abaixo. Linhas com erros impedirão o salvamento.")
 
-        # Componente principal: st.data_editor
-        # num_rows="dynamic" permite ao usuário excluir linhas erradas ou adicionar novas
+        # Editor de dados
         df_editado = st.data_editor(
             st.session_state.dados_para_revisar,
             width="stretch",
             num_rows="dynamic",
             column_config={
-                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
-                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
+                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", step=1),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f", min_value=0.0),
                 "descricao": st.column_config.TextColumn("Descrição/Estabelecimento", width="large"),
             }
         )
@@ -101,20 +106,49 @@ def render_upload_section():
         
         with col1:
             if st.button("💾 Confirmar e Salvar", type="primary"):
-                with st.spinner("Salvando..."):
-                    # Validação: Remove linhas onde a descrição está vazia
+                with st.spinner("Validando dados..."):
+                    # 1. Limpeza Inicial
                     df_final = df_editado.dropna(subset=['descricao']).copy()
                     
-                    if not df_final.empty:
-                        # Normaliza datas para string antes do SQLite
-                        df_final['data'] = pd.to_datetime(df_final['data']).dt.strftime('%Y-%m-%d')
-                        df_final['valor'] = df_final['valor'].fillna(0.0)
-                        
-                        insert_transactions(df_final)
-                        st.success("✅ Dados persistidos com sucesso!")
-                        limpar_buffer() # Limpa após sucesso
+                    if df_final.empty:
+                        st.warning("⚠️ Nenhuma transação válida (com descrição) para salvar.")
                     else:
-                        st.warning("Não há dados válidos para salvar.")
+                        # 2. Conversão e Normalização
+                        df_final['data'] = pd.to_datetime(df_final['data'], errors='coerce')
+                        df_final['valor'] = pd.to_numeric(df_final['valor'], errors='coerce').fillna(0.0)
+
+                        # 3. Validações de Regra de Negócio
+                        erros_impeditivos = []
+                        avisos = []
+
+                        # Regra: Valores Negativos
+                        if (df_final['valor'] < 0).any():
+                            erros_impeditivos.append("❌ Existem valores negativos. Corrija para prosseguir.")
+
+                        # Regra: Datas no Futuro
+                        if (df_final['data'] > pd.Timestamp.now()).any():
+                            avisos.append("⚠️ Atenção: Existem datas futuras nos registros.")
+
+                        # Regra: Datas Vazias
+                        n_sem_data = df_final['data'].isna().sum()
+                        if n_sem_data > 0:
+                            avisos.append(f"ℹ️ {n_sem_data} transação(ões) sem data receberão a data de hoje.")
+                            df_final['data'] = df_final['data'].fillna(pd.Timestamp.now())
+
+                        # Decisão de Salvamento
+                        if erros_impeditivos:
+                            for err in erros_impeditivos:
+                                st.error(err)
+                        else:
+                            for warn in avisos:
+                                st.toast(warn, icon="⚠️")
+                            
+                            # Formatação Final para SQLite
+                            df_final['data'] = df_final['data'].dt.strftime('%Y-%m-%d')
+                            
+                            insert_transactions(df_final)
+                            st.success("✅ Dados persistidos com sucesso!")
+                            limpar_buffer()
         
         with col2:
             if st.button("🗑️ Descartar Tudo"):
