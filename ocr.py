@@ -5,12 +5,18 @@ import easyocr
 import cv2
 import numpy as np
 import time
+from functools import lru_cache
 from PIL import Image
 import io
 
-# Inicializa o leitor para Português. 
-# O download do modelo ocorre apenas na primeira execução.
-reader = easyocr.Reader(['pt'])
+@lru_cache(maxsize=2)
+def obter_leitor_ocr(idiomas=("pt",), gpu=False):
+    """
+    Inicializa e mantém em cache o leitor do EasyOCR.
+
+    Isso evita recarregar modelos a cada rerun do Streamlit.
+    """
+    return easyocr.Reader(list(idiomas), gpu=gpu)
 
 def preprocessar_imagem_ocr(img_np):
     """
@@ -47,19 +53,23 @@ def extrair_texto_imagem(arquivo_imagem):
         img_pil = Image.open(arquivo_imagem)
         img_np = np.array(img_pil)
         
-        # 2. Otimização de Imagem (Critério: Pré-processamento)
-        img_preprocessada = preprocessar_imagem_ocr(img_np)
-        
-        # 3. Execução do OCR (Critério: Suporte a Idiomas/Português)
+        # 2. Execução do OCR (Critério: Suporte a Idiomas/Português)
         # detail=0 retorna apenas o texto bruto consolidado
-        resultados = reader.readtext(img_preprocessada, detail=0)
+        reader = obter_leitor_ocr()
+        resultados = reader.readtext(img_np, detail=0)
+
+        # 3. Fallback: aplicar pré-processamento apenas se necessário
+        if not resultados:
+            img_preprocessada = preprocessar_imagem_ocr(img_np)
+            resultados = reader.readtext(img_preprocessada, detail=0)
         texto_total = " ".join(str(item) for item in resultados)
         
         fim = time.time()
         tempo_total = fim - inicio
         
         # 4. Logs de Execução (Critério: Monitorar performance)
-        print(f" [OCR] Arquivo: {arquivo_imagem.name} | Tempo: {tempo_total:.2f}s")
+        nome_arquivo = getattr(arquivo_imagem, "name", "BytesIO")
+        print(f" [OCR] Arquivo: {nome_arquivo} | Tempo: {tempo_total:.2f}s")
         
         return texto_total, tempo_total, None
 
