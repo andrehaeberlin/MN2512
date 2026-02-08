@@ -5,12 +5,18 @@ import easyocr
 import cv2
 import numpy as np
 import time
+from functools import lru_cache
 from PIL import Image
 import io
 
-# Inicializa o leitor para Português. 
-# O download do modelo ocorre apenas na primeira execução.
-reader = easyocr.Reader(['pt'])
+@lru_cache(maxsize=2)
+def obter_leitor_ocr(idiomas=("pt",), gpu=False):
+    """
+    Inicializa e mantém em cache o leitor do EasyOCR.
+
+    Isso evita recarregar modelos a cada rerun do Streamlit.
+    """
+    return easyocr.Reader(list(idiomas), gpu=gpu)
 
 def preprocessar_imagem_ocr(img_np):
     """
@@ -52,6 +58,7 @@ def extrair_texto_imagem(arquivo_imagem):
         
         # 3. Execução do OCR (Critério: Suporte a Idiomas/Português)
         # detail=0 retorna apenas o texto bruto consolidado
+        reader = obter_leitor_ocr()
         resultados = reader.readtext(img_preprocessada, detail=0)
         texto_total = " ".join(str(item) for item in resultados)
         
