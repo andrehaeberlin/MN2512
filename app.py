@@ -57,15 +57,28 @@ def render_upload_section():
                     with st.spinner(f"Extraindo dados de {arq.name}..."):
                         texto_total = ""
                         if extensao == 'pdf':
-                            texto_pdf, is_scanned, _ = extrair_texto_pdf(arq)
+                            texto_pdf, is_scanned, erro_pdf = extrair_texto_pdf(arq)
+                            if erro_pdf:
+                                st.error(erro_pdf)
+                                continue
                             if is_scanned:
-                                for img_buffer in converter_pdf_para_imagens(arq):
-                                    t, _, _ = extrair_texto_imagem(img_buffer)
+                                imagens, erro_imagens = converter_pdf_para_imagens(arq)
+                                if erro_imagens:
+                                    st.error(erro_imagens)
+                                    continue
+                                for img_buffer in imagens:
+                                    t, _, erro_ocr = extrair_texto_imagem(img_buffer)
+                                    if erro_ocr:
+                                        st.error(erro_ocr)
+                                        continue
                                     texto_total += t + "\n"
                             else:
                                 texto_total = texto_pdf
                         else:
-                            texto_total, _, _ = extrair_texto_imagem(arq)
+                            texto_total, _, erro_ocr = extrair_texto_imagem(arq)
+                            if erro_ocr:
+                                st.error(erro_ocr)
+                                continue
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
