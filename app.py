@@ -82,11 +82,19 @@ def render_upload_section():
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
-    
+                        if not dados_extraidos:
+                            st.warning(f"Nenhum dado financeiro identificado em {arq.name}.")
+                            continue
+
+                        if isinstance(dados_extraidos, dict):
+                            dados_extraidos = [dados_extraidos]
+
+                        df_extraido = pd.DataFrame(dados_extraidos)
+
                         # ADICIONADO: Metadados
-                        dados_extraidos['fonte'] = arq.name
-                        dados_extraidos['categoria'] = 'Não categorizado'
-                        novos_dados.append(pd.DataFrame([dados_extraidos]))
+                        df_extraido['fonte'] = arq.name
+                        df_extraido['categoria'] = 'Não categorizado'
+                        novos_dados.append(df_extraido)
             # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
