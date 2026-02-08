@@ -40,17 +40,17 @@ def render_upload_section():
                 
                 # 1. Processamento de Planilhas
                 if extensao in ['xlsx', 'csv']:
-    with st.spinner(f"Processando planilha {arq.name}..."):
-        df_plan, erro = processar_planilha(arq)
-        if not erro:
-            # ADICIONADO: Garante colunas de integridade
-            df_plan['fonte'] = arq.name
+                    with st.spinner(f"Processando planilha {arq.name}..."):
+                        df_plan, erro = processar_planilha(arq)
+                        if not erro:
+                            # ADICIONADO: Garante colunas de integridade
+                            df_plan['fonte'] = arq.name
 
-            if 'categoria' not in df_plan.columns:
-                df_plan['categoria'] = 'Outros'
-            
-            # Selecionamos TODAS as colunas necessárias
-            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
+                            if 'categoria' not in df_plan.columns:
+                                df_plan['categoria'] = 'Outros'
+                            
+                            # Selecionamos TODAS as colunas necessárias
+                            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
                 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
@@ -82,11 +82,19 @@ def render_upload_section():
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
-    
+                        if not dados_extraidos:
+                            st.warning(f"Nenhum dado financeiro identificado em {arq.name}.")
+                            continue
+
+                        if isinstance(dados_extraidos, dict):
+                            dados_extraidos = [dados_extraidos]
+
+                        df_extraido = pd.DataFrame(dados_extraidos)
+
                         # ADICIONADO: Metadados
-                        dados_extraidos['fonte'] = arq.name
-                        dados_extraidos['categoria'] = 'Não categorizado'
-                        novos_dados.append(pd.DataFrame([dados_extraidos]))
+                        df_extraido['fonte'] = arq.name
+                        df_extraido['categoria'] = 'Não categorizado'
+                        novos_dados.append(df_extraido)
             # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
