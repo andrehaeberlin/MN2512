@@ -40,10 +40,17 @@ def render_upload_section():
                 
                 # 1. Processamento de Planilhas
                 if extensao in ['xlsx', 'csv']:
-                    with st.spinner(f"Processando planilha {arq.name}..."):
-                        df_plan, erro = processar_planilha(arq)
-                        if not erro:
-                            novos_dados.append(df_plan[['data', 'valor', 'descricao']])
+    with st.spinner(f"Processando planilha {arq.name}..."):
+        df_plan, erro = processar_planilha(arq)
+        if not erro:
+            # ADICIONADO: Garante colunas de integridade
+            df_plan['fonte'] = arq.name
+
+            if 'categoria' not in df_plan.columns:
+                df_plan['categoria'] = 'Outros'
+            
+            # Selecionamos TODAS as colunas necessárias
+            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
                 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
@@ -62,12 +69,11 @@ def render_upload_section():
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
-                        
-                        # Correção Crítica: Verificamos se há dados e criamos o DF sem colchetes extras
-                        if dados_extraidos:
-                            df_temp = pd.DataFrame(dados_extraidos)
-                            novos_dados.append(df_temp)
-
+    
+                        # ADICIONADO: Metadados
+                        dados_extraidos['fonte'] = arq.name
+                        dados_extraidos['categoria'] = 'Não categorizado'
+                        novos_dados.append(pd.DataFrame([dados_extraidos]))
             # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
@@ -93,12 +99,20 @@ def render_upload_section():
         # Editor de dados
         df_editado = st.data_editor(
             st.session_state.dados_para_revisar,
-            width="stretch",
+            width=None, # Stretch automático
             num_rows="dynamic",
             column_config={
-                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", step=1),
-                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f", min_value=0.0),
-                "descricao": st.column_config.TextColumn("Descrição/Estabelecimento", width="large"),
+                "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", required=True),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f", required=True),
+                "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+                # ADICIONADO: Selectbox para facilitar classificação
+                "categoria": st.column_config.SelectboxColumn(
+                    "Categoria",
+                    options=["Alimentação", "Transporte", "Serviços", "Outros"],
+                    required=True
+                ),
+                # ADICIONADO: Fonte apenas leitura para auditoria
+                "fonte": st.column_config.TextColumn("Fonte", disabled=True, width="small"),
             }
         )
 
