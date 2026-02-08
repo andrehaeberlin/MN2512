@@ -217,12 +217,52 @@ def render_history_section():
     else:
         st.info("Nenhum registro encontrado.")
 
+def render_dashboard_section():
+    st.title("📊 Financial Insights Dashboard")
+    df_historico = get_all_transactions()
+
+    if df_historico.empty:
+        st.info("Nenhum registro encontrado para gerar insights.")
+        return
+
+    df_historico['data'] = pd.to_datetime(df_historico['data'], errors='coerce')
+    df_historico['valor'] = pd.to_numeric(df_historico['valor'], errors='coerce')
+
+    total_transacoes = len(df_historico)
+    total_valor = df_historico['valor'].sum()
+    valor_medio = df_historico['valor'].mean()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total de Transações", f"{total_transacoes}")
+    col2.metric("Valor Total (R$)", f"{total_valor:,.2f}")
+    col3.metric("Valor Médio (R$)", f"{valor_medio:,.2f}")
+
+    st.subheader("Gastos por Categoria")
+    por_categoria = (
+        df_historico.groupby('categoria', dropna=False)['valor']
+        .sum()
+        .sort_values(ascending=False)
+    )
+    st.bar_chart(por_categoria, use_container_width=True)
+
+    st.subheader("Evolução Mensal")
+    por_mes = (
+        df_historico.dropna(subset=['data'])
+        .assign(mes=lambda df: df['data'].dt.to_period('M').dt.to_timestamp())
+        .groupby('mes')['valor']
+        .sum()
+        .sort_index()
+    )
+    st.line_chart(por_mes, use_container_width=True)
+
 # --- NAVEGAÇÃO ---
 with st.sidebar:
     st.title("🚀 Extrator Pro")
-    aba = st.radio("Navegação", ["Início", "Histórico"])
+    aba = st.radio("Navegação", ["Início", "Histórico", "Dashboard"])
 
 if aba == "Início":
     render_upload_section()
+elif aba == "Dashboard":
+    render_dashboard_section()
 else:
     render_history_section()
