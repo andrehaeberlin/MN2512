@@ -40,32 +40,45 @@ def render_upload_section():
                 
                 # 1. Processamento de Planilhas
                 if extensao in ['xlsx', 'csv']:
-    with st.spinner(f"Processando planilha {arq.name}..."):
-        df_plan, erro = processar_planilha(arq)
-        if not erro:
-            # ADICIONADO: Garante colunas de integridade
-            df_plan['fonte'] = arq.name
+                    with st.spinner(f"Processando planilha {arq.name}..."):
+                        df_plan, erro = processar_planilha(arq)
+                        if not erro:
+                            # ADICIONADO: Garante colunas de integridade
+                            df_plan['fonte'] = arq.name
 
-            if 'categoria' not in df_plan.columns:
-                df_plan['categoria'] = 'Outros'
-            
-            # Selecionamos TODAS as colunas necessárias
-            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
+                            if 'categoria' not in df_plan.columns:
+                                df_plan['categoria'] = 'Outros'
+                            
+                            # Selecionamos TODAS as colunas necessárias
+                            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
                 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
                     with st.spinner(f"Extraindo dados de {arq.name}..."):
                         texto_total = ""
                         if extensao == 'pdf':
-                            texto_pdf, is_scanned, _ = extrair_texto_pdf(arq)
+                            texto_pdf, is_scanned, erro_pdf = extrair_texto_pdf(arq)
+                            if erro_pdf:
+                                st.error(erro_pdf)
+                                continue
                             if is_scanned:
-                                for img_buffer in converter_pdf_para_imagens(arq):
-                                    t, _, _ = extrair_texto_imagem(img_buffer)
+                                imagens, erro_imagens = converter_pdf_para_imagens(arq)
+                                if erro_imagens:
+                                    st.error(erro_imagens)
+                                    continue
+                                for img_buffer in imagens:
+                                    t, _, erro_ocr = extrair_texto_imagem(img_buffer)
+                                    if erro_ocr:
+                                        st.error(erro_ocr)
+                                        continue
                                     texto_total += t + "\n"
                             else:
                                 texto_total = texto_pdf
                         else:
-                            texto_total, _, _ = extrair_texto_imagem(arq)
+                            texto_total, _, erro_ocr = extrair_texto_imagem(arq)
+                            if erro_ocr:
+                                st.error(erro_ocr)
+                                continue
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)

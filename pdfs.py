@@ -34,18 +34,29 @@ def extrair_texto_pdf(arquivo_pdf):
 
 def converter_pdf_para_imagens(arquivo_pdf, dpi=300):
     """MN2512-15: Converte páginas de PDF em imagens para OCR."""
-    arquivo_pdf.seek(0)
+    imagens = []
+    erro = None
 
-    pdf_documento = fitz.open(stream=arquivo_pdf.read(), filetype="pdf")
-    
-    for num_pagina in range(len(pdf_documento)):
-        pagina = pdf_documento.load_page(num_pagina)
-        zoom = dpi / 72
-        pixmap = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-        img_pil = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-        buffer = io.BytesIO()
-        img_pil.save(buffer, format="PNG")
-        buffer.seek(0)
-        yield buffer
-    
-    pdf_documento.close()
+    try:
+        arquivo_pdf.seek(0)
+
+        pdf_documento = fitz.open(stream=arquivo_pdf.read(), filetype="pdf")
+        
+        for num_pagina in range(len(pdf_documento)):
+            pagina = pdf_documento.load_page(num_pagina)
+            zoom = dpi / 72
+            pixmap = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            img_pil = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+            buffer = io.BytesIO()
+            img_pil.save(buffer, format="PNG")
+            buffer.seek(0)
+            imagens.append(buffer)
+        
+        pdf_documento.close()
+    except Exception as e:
+        if "password" in str(e).lower():
+            erro = "Este PDF está protegido por senha."
+        else:
+            erro = f"Erro ao converter PDF em imagens: {str(e)}"
+
+    return imagens, erro
