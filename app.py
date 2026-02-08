@@ -3,6 +3,7 @@ import streamlit as st
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
 from extrator_regex import extrair_dados_financeiros
+from llm_extractor import extrair_dados_financeiros_llm
 from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
 import datetime
@@ -85,8 +86,14 @@ def render_upload_section():
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
                         if not dados_extraidos:
-                            st.warning(f"Nenhum dado financeiro identificado em {arq.name}.")
-                            continue
+                            with st.spinner("Fallback LLM em execução..."):
+                                dados_extraidos, erro_llm = extrair_dados_financeiros_llm(texto_total)
+                            if erro_llm:
+                                st.warning(f"{erro_llm} ({arq.name})")
+                                continue
+                            if not dados_extraidos:
+                                st.warning(f"Nenhum dado financeiro identificado em {arq.name}.")
+                                continue
 
                         if isinstance(dados_extraidos, dict):
                             dados_extraidos = [dados_extraidos]
