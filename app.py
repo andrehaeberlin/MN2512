@@ -3,6 +3,7 @@ import streamlit as st
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
 from extrator_regex import extrair_dados_financeiros
+from llm_extractor import extrair_dados_financeiros_llm
 from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
 import datetime
@@ -40,40 +41,69 @@ def render_upload_section():
                 
                 # 1. Processamento de Planilhas
                 if extensao in ['xlsx', 'csv']:
-    with st.spinner(f"Processando planilha {arq.name}..."):
-        df_plan, erro = processar_planilha(arq)
-        if not erro:
-            # ADICIONADO: Garante colunas de integridade
-            df_plan['fonte'] = arq.name
+                    with st.spinner(f"Processando planilha {arq.name}..."):
+                        df_plan, erro = processar_planilha(arq)
+                        if not erro:
+                            # ADICIONADO: Garante colunas de integridade
+                            df_plan['fonte'] = arq.name
 
-            if 'categoria' not in df_plan.columns:
-                df_plan['categoria'] = 'Outros'
-            
-            # Selecionamos TODAS as colunas necessárias
-            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
+                            if 'categoria' not in df_plan.columns:
+                                df_plan['categoria'] = 'Outros'
+                            
+                            # Selecionamos TODAS as colunas necessárias
+                            novos_dados.append(df_plan[['data', 'valor', 'descricao', 'fonte', 'categoria']])
                 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
                     with st.spinner(f"Extraindo dados de {arq.name}..."):
                         texto_total = ""
                         if extensao == 'pdf':
-                            texto_pdf, is_scanned, _ = extrair_texto_pdf(arq)
+                            texto_pdf, is_scanned, erro_pdf = extrair_texto_pdf(arq)
+                            if erro_pdf:
+                                st.error(erro_pdf)
+                                continue
                             if is_scanned:
-                                for img_buffer in converter_pdf_para_imagens(arq):
-                                    t, _, _ = extrair_texto_imagem(img_buffer)
-                                    texto_total += t + "\n"
+                                imagens, erro_imagens = converter_pdf_para_imagens(arq)
+                                if erro_imagens:
+                                    st.error(erro_imagens)
+                                    continue
+                                with st.spinner(f"Executando OCR em {arq.name}..."):
+                                    for img_buffer in imagens:
+                                        t, _, erro_ocr = extrair_texto_imagem(img_buffer)
+                                        if erro_ocr:
+                                            st.error(erro_ocr)
+                                            continue
+                                        texto_total += t + "\n"
                             else:
                                 texto_total = texto_pdf
                         else:
-                            texto_total, _, _ = extrair_texto_imagem(arq)
+                            with st.spinner(f"Executando OCR em {arq.name}..."):
+                                texto_total, _, erro_ocr = extrair_texto_imagem(arq)
+                            if erro_ocr:
+                                st.error(erro_ocr)
+                                continue
                         
                         # NOVA LÓGICA: Recebe uma lista de dicionários
                         dados_extraidos = extrair_dados_financeiros(texto_total)
-    
+                        if not dados_extraidos:
+                            with st.spinner("Fallback LLM em execução..."):
+                                dados_extraidos, erro_llm = extrair_dados_financeiros_llm(texto_total)
+                            if erro_llm:
+                                st.warning(f"{erro_llm} ({arq.name})")
+                                continue
+                            if not dados_extraidos:
+                                st.warning(f"Nenhum dado financeiro identificado em {arq.name}.")
+                                continue
+
+                        if isinstance(dados_extraidos, dict):
+                            dados_extraidos = [dados_extraidos]
+
+                        df_extraido = pd.DataFrame(dados_extraidos)
+
                         # ADICIONADO: Metadados
-                        dados_extraidos['fonte'] = arq.name
-                        dados_extraidos['categoria'] = 'Não categorizado'
-                        novos_dados.append(pd.DataFrame([dados_extraidos]))
+                        df_extraido['fonte'] = arq.name
+                        df_extraido['categoria'] = 'Não categorizado'
+                        novos_dados.append(df_extraido)
             # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
@@ -99,7 +129,7 @@ def render_upload_section():
         # Editor de dados
         df_editado = st.data_editor(
             st.session_state.dados_para_revisar,
-            width=None, # Stretch automático
+            width="stretch",
             num_rows="dynamic",
             column_config={
                 "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", required=True),
@@ -162,6 +192,7 @@ def render_upload_section():
                             
                             insert_transactions(df_final)
                             st.success("✅ Dados persistidos com sucesso!")
+                            st.toast("Dados atualizados no banco com sucesso!", icon="✅")
                             limpar_buffer()
         
         with col2:
