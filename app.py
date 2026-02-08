@@ -66,16 +66,18 @@ def render_upload_section():
                                 if erro_imagens:
                                     st.error(erro_imagens)
                                     continue
-                                for img_buffer in imagens:
-                                    t, _, erro_ocr = extrair_texto_imagem(img_buffer)
-                                    if erro_ocr:
-                                        st.error(erro_ocr)
-                                        continue
-                                    texto_total += t + "\n"
+                                with st.spinner(f"Executando OCR em {arq.name}..."):
+                                    for img_buffer in imagens:
+                                        t, _, erro_ocr = extrair_texto_imagem(img_buffer)
+                                        if erro_ocr:
+                                            st.error(erro_ocr)
+                                            continue
+                                        texto_total += t + "\n"
                             else:
                                 texto_total = texto_pdf
                         else:
-                            texto_total, _, erro_ocr = extrair_texto_imagem(arq)
+                            with st.spinner(f"Executando OCR em {arq.name}..."):
+                                texto_total, _, erro_ocr = extrair_texto_imagem(arq)
                             if erro_ocr:
                                 st.error(erro_ocr)
                                 continue
@@ -183,6 +185,7 @@ def render_upload_section():
                             
                             insert_transactions(df_final)
                             st.success("✅ Dados persistidos com sucesso!")
+                            st.toast("Dados atualizados no banco com sucesso!", icon="✅")
                             limpar_buffer()
         
         with col2:
