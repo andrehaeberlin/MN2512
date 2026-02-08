@@ -120,7 +120,7 @@ def render_upload_section():
         # Editor de dados
         df_editado = st.data_editor(
             st.session_state.dados_para_revisar,
-            width=None, # Stretch automático
+            width="stretch",
             num_rows="dynamic",
             column_config={
                 "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", required=True),
