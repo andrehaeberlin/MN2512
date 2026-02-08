@@ -66,7 +66,8 @@ def extrair_texto_imagem(arquivo_imagem):
         tempo_total = fim - inicio
         
         # 4. Logs de Execução (Critério: Monitorar performance)
-        print(f" [OCR] Arquivo: {arquivo_imagem.name} | Tempo: {tempo_total:.2f}s")
+        nome_arquivo = getattr(arquivo_imagem, "name", "BytesIO")
+        print(f" [OCR] Arquivo: {nome_arquivo} | Tempo: {tempo_total:.2f}s")
         
         return texto_total, tempo_total, None
 
