@@ -3,7 +3,7 @@ import streamlit as st
 from localDB import init_db, insert_transactions, get_all_transactions
 from planilhas import processar_planilha
 from extrator_regex import extrair_dados_financeiros
-from llm_extractor import extrair_dados_financeiros_llm
+from llm_extractor import extrair_dados_financeiros_llm, categorizar_transacoes_llm
 from pdfs import extrair_texto_pdf, converter_pdf_para_imagens
 from ocr import extrair_texto_imagem
 import datetime
@@ -98,11 +98,17 @@ def render_upload_section():
                         if isinstance(dados_extraidos, dict):
                             dados_extraidos = [dados_extraidos]
 
+                        dados_extraidos, erro_cat = categorizar_transacoes_llm(dados_extraidos)
+                        if erro_cat:
+                            st.info(f"Categorização automática indisponível: {erro_cat} ({arq.name})")
+
                         df_extraido = pd.DataFrame(dados_extraidos)
 
                         # ADICIONADO: Metadados
                         df_extraido['fonte'] = arq.name
-                        df_extraido['categoria'] = 'Não categorizado'
+                        if 'categoria' not in df_extraido.columns:
+                            df_extraido['categoria'] = 'Outros'
+                        df_extraido['categoria'] = df_extraido['categoria'].fillna('Outros')
                         novos_dados.append(df_extraido)
             # Consolidação dos dados
             if novos_dados:
