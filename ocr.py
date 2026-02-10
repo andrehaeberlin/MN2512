@@ -53,13 +53,15 @@ def extrair_texto_imagem(arquivo_imagem):
         img_pil = Image.open(arquivo_imagem)
         img_np = np.array(img_pil)
         
-        # 2. Otimização de Imagem (Critério: Pré-processamento)
-        img_preprocessada = preprocessar_imagem_ocr(img_np)
-        
-        # 3. Execução do OCR (Critério: Suporte a Idiomas/Português)
+        # 2. Execução do OCR (Critério: Suporte a Idiomas/Português)
         # detail=0 retorna apenas o texto bruto consolidado
         reader = obter_leitor_ocr()
-        resultados = reader.readtext(img_preprocessada, detail=0)
+        resultados = reader.readtext(img_np, detail=0)
+
+        # 3. Fallback: aplicar pré-processamento apenas se necessário
+        if not resultados:
+            img_preprocessada = preprocessar_imagem_ocr(img_np)
+            resultados = reader.readtext(img_preprocessada, detail=0)
         texto_total = " ".join(str(item) for item in resultados)
         
         fim = time.time()
