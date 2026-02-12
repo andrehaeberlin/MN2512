@@ -5,7 +5,14 @@ import pandas as pd
 import streamlit as st
 from extrator_regex import extrair_dados_financeiros
 from llm_extractor import extrair_dados_financeiros_llm, categorizar_transacoes_llm
-from localDB import get_all_transactions, init_db, insert_transactions
+from localDB import (
+    find_transaction_id,
+    get_all_transactions,
+    init_db,
+    insert_document,
+    insert_transactions,
+    link_entities,
+)
 from ocr import extrair_texto_imagem
 from pdfs import converter_pdf_para_imagens, extrair_texto_pdf
 from planilhas import processar_planilha
@@ -75,6 +82,7 @@ def render_upload_section():
 
             for arq in arquivos:
                 extensao = arq.name.split(".")[-1].lower()
+                document_id = None
 
                 # 1. Processamento de Planilhas
                 if extensao in ["xlsx", "csv"]:
@@ -90,6 +98,11 @@ def render_upload_section():
 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
+                    with st.spinner(f"Registrando documento {arq.name}..."):
+                        file_bytes = arq.getvalue()
+                        mime = arq.type or "application/octet-stream"
+                        document_id = insert_document(arq.name, mime, file_bytes)
+
                     with st.spinner(f"Extraindo dados de {arq.name}..."):
                         texto_total = ""
                         if extensao == "pdf":
@@ -139,6 +152,7 @@ def render_upload_section():
                         df_extraido = pd.DataFrame(dados_extraidos)
 
                         df_extraido["fonte"] = arq.name
+                        df_extraido["document_id"] = document_id
                         if "categoria" not in df_extraido.columns:
                             df_extraido["categoria"] = "Outros"
                         df_extraido["categoria"] = df_extraido["categoria"].fillna("Outros")
@@ -178,6 +192,7 @@ def render_upload_section():
                     "Categoria", options=["Alimentação", "Transporte", "Serviços", "Outros"], required=True
                 ),
                 "fonte": st.column_config.TextColumn("Fonte", disabled=True, width="small"),
+                "document_id": st.column_config.NumberColumn("Doc ID", disabled=True, width="small"),
             },
         )
 
@@ -227,6 +242,16 @@ def render_upload_section():
                             df_final["data"] = df_final["data"].dt.strftime("%Y-%m-%d")
 
                             insert_transactions(df_final)
+
+                            for _, row in df_final.iterrows():
+                                doc_id = row.get("document_id")
+                                if pd.notna(doc_id):
+                                    tx_id = find_transaction_id(
+                                        row["data"], row["descricao"], float(row["valor"]), row["fonte"]
+                                    )
+                                    if tx_id:
+                                        link_entities("transaction", tx_id, "document", int(doc_id))
+
                             st.success("✅ Dados persistidos com sucesso!")
                             st.toast("Dados atualizados no banco com sucesso!", icon="✅")
                             limpar_buffer()
