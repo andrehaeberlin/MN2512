@@ -2,9 +2,10 @@ import hashlib
 import os
 import sqlite3
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import pandas as pd
+from parsers.ofx_parser import StatementLine, build_hash_linha
 
 DB_NAME = "dados_financeiros.db"
 
@@ -201,3 +202,43 @@ def get_all_transactions():
             return pd.read_sql_query("SELECT * FROM transacoes ORDER BY data DESC", conn)
     except Exception:
         return pd.DataFrame()
+
+
+def insert_statement(document_id: int, banco: Optional[str], cartao: Optional[str], competencia: str) -> int:
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.execute(
+            "INSERT INTO statements (document_id, banco, cartao, competencia) VALUES (?, ?, ?, ?)",
+            (int(document_id), banco, cartao, competencia),
+        )
+        return int(cur.lastrowid)
+
+
+def insert_statement_lines(statement_id: int, competencia: str, lines: Iterable[StatementLine]) -> int:
+    payload = []
+    for ln in lines:
+        payload.append(
+            (
+                int(statement_id),
+                ln.data,
+                ln.descricao,
+                float(ln.valor),
+                ln.parcela_total,
+                ln.parcela_atual,
+                ln.merchant,
+                build_hash_linha(competencia, ln),
+            )
+        )
+
+    if not payload:
+        return 0
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cur = conn.executemany(
+            """
+            INSERT OR IGNORE INTO statement_lines
+            (statement_id, data, descricao, valor, parcela_total, parcela_atual, merchant, hash_linha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+        return cur.rowcount

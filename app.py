@@ -4,16 +4,19 @@ import datetime
 import pandas as pd
 import streamlit as st
 from extrator_regex import extrair_dados_financeiros
-from llm_extractor import extrair_dados_financeiros_llm, categorizar_transacoes_llm
+from llm_extractor import categorizar_transacoes_llm, extrair_dados_financeiros_llm
 from localDB import (
     find_transaction_id,
     get_all_transactions,
     init_db,
     insert_document,
+    insert_statement,
+    insert_statement_lines,
     insert_transactions,
     link_entities,
 )
 from ocr import extrair_texto_imagem
+from parsers.ofx_parser import StatementLine, parse_ofx_bytes
 from pdfs import converter_pdf_para_imagens, extrair_texto_pdf
 from planilhas import processar_planilha
 
@@ -26,6 +29,10 @@ st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide
 # --- INICIALIZAÇÃO DO ESTADO ---
 if "dados_para_revisar" not in st.session_state:
     st.session_state.dados_para_revisar = pd.DataFrame(columns=["data", "valor", "descricao"])
+if "ofx_preview_df" not in st.session_state:
+    st.session_state.ofx_preview_df = pd.DataFrame()
+if "ofx_doc_id" not in st.session_state:
+    st.session_state.ofx_doc_id = None
 
 
 def limpar_buffer():
@@ -158,11 +165,8 @@ def render_upload_section():
                         df_extraido["categoria"] = df_extraido["categoria"].fillna("Outros")
                         novos_dados.append(df_extraido)
 
-            # Consolidação dos dados
             if novos_dados:
                 df_acumulado = pd.concat(novos_dados, ignore_index=True)
-
-                # Conversão robusta de tipos
                 df_acumulado["data"] = pd.to_datetime(df_acumulado["data"], errors="coerce")
                 df_acumulado["valor"] = pd.to_numeric(df_acumulado["valor"], errors="coerce")
 
@@ -173,13 +177,11 @@ def render_upload_section():
             else:
                 st.warning("Nenhum dado financeiro foi identificado nos arquivos.")
 
-    # --- SEÇÃO DE PREVIEW E CONFERÊNCIA ---
     if not st.session_state.dados_para_revisar.empty:
         st.divider()
         st.subheader("📋 Preview de Conferência (Validação)")
         st.info("Verifique os dados abaixo. Linhas com erros impedirão o salvamento.")
 
-        # Editor de dados
         df_editado = st.data_editor(
             st.session_state.dados_para_revisar,
             width="stretch",
@@ -201,36 +203,29 @@ def render_upload_section():
         with col1:
             if st.button("💾 Confirmar e Salvar", type="primary"):
                 with st.spinner("Validando dados..."):
-                    # 1. Limpeza Inicial
                     df_final = df_editado.dropna(subset=["descricao"]).copy()
 
                     if df_final.empty:
                         st.warning("⚠️ Nenhuma transação válida (com descrição) para salvar.")
                     else:
-                        # 2. Conversão e Normalização
                         df_final["data"] = pd.to_datetime(df_final["data"], errors="coerce")
                         df_final["valor"] = pd.to_numeric(df_final["valor"], errors="coerce").fillna(0.0)
 
-                        # 3. Validações de Regra de Negócio
                         erros_impeditivos = []
                         avisos = []
 
-                        # Regra: Valores Negativos
                         if (df_final["valor"] < 0).any():
                             erros_impeditivos.append("❌ Existem valores negativos. Corrija para prosseguir.")
 
-                        # Regra: Datas no Futuro (comparando apenas data calendário)
                         datas_futuras = df_final["data"].dt.date > datetime.date.today()
                         if datas_futuras.fillna(False).any():
                             avisos.append("⚠️ Atenção: Existem datas futuras nos registros.")
 
-                        # Regra: Datas Vazias
                         n_sem_data = df_final["data"].isna().sum()
                         if n_sem_data > 0:
                             avisos.append(f"ℹ️ {n_sem_data} transação(ões) sem data receberão a data de hoje.")
                             df_final["data"] = df_final["data"].fillna(pd.Timestamp(datetime.date.today()))
 
-                        # Decisão de Salvamento
                         if erros_impeditivos:
                             for err in erros_impeditivos:
                                 st.error(err)
@@ -238,9 +233,7 @@ def render_upload_section():
                             for warn in avisos:
                                 st.toast(warn, icon="⚠️")
 
-                            # Formatação Final para SQLite
                             df_final["data"] = df_final["data"].dt.strftime("%Y-%m-%d")
-
                             insert_transactions(df_final)
 
                             for _, row in df_final.iterrows():
@@ -259,6 +252,78 @@ def render_upload_section():
         with col2:
             if st.button("🗑️ Descartar Tudo"):
                 limpar_buffer()
+
+
+def render_ofx_import():
+    st.title("💳 Importar Fatura via OFX")
+
+    arq = st.file_uploader("Envie um arquivo OFX", type=["ofx"], key="ofx_uploader")
+    if not arq:
+        return
+
+    ofx_bytes = arq.getvalue()
+    doc_id = insert_document(arq.name, arq.type or "application/x-ofx", ofx_bytes)
+
+    competencia_default = pd.Timestamp.today().strftime("%Y-%m")
+    competencia = st.text_input("Competência (YYYY-MM)", value=competencia_default, key="ofx_competencia")
+    banco = st.text_input("Banco (opcional)", value="", key="ofx_banco")
+    cartao = st.text_input("Cartão (opcional)", value="", key="ofx_cartao")
+
+    if st.button("⚙️ Processar OFX", key="processar_ofx"):
+        lines = parse_ofx_bytes(ofx_bytes)
+        preview = pd.DataFrame(
+            [
+                {
+                    "data": line.data,
+                    "descricao": line.descricao,
+                    "valor": line.valor,
+                    "parcela_atual": line.parcela_atual,
+                    "parcela_total": line.parcela_total,
+                    "merchant": line.merchant,
+                }
+                for line in lines
+            ]
+        )
+        st.session_state.ofx_preview_df = preview
+        st.session_state.ofx_doc_id = doc_id
+
+    if not st.session_state.ofx_preview_df.empty:
+        st.subheader("📋 Linhas extraídas (revise antes de salvar)")
+        df_edit = st.data_editor(
+            st.session_state.ofx_preview_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_ofx",
+        )
+
+        if st.button("💾 Salvar fatura e linhas", key="salvar_ofx"):
+            statement_id = insert_statement(
+                st.session_state.ofx_doc_id,
+                banco or None,
+                cartao or None,
+                competencia,
+            )
+
+            lines = []
+            for _, row in df_edit.iterrows():
+                data_value = None
+                if pd.notna(row.get("data")):
+                    parsed_date = pd.to_datetime(row.get("data"), errors="coerce")
+                    data_value = parsed_date.strftime("%Y-%m-%d") if pd.notna(parsed_date) else None
+
+                lines.append(
+                    StatementLine(
+                        data=data_value,
+                        descricao=str(row.get("descricao") or "Não identificado"),
+                        valor=float(row.get("valor") or 0.0),
+                        merchant=str(row.get("merchant")) if pd.notna(row.get("merchant")) else None,
+                        parcela_atual=int(row.get("parcela_atual")) if pd.notna(row.get("parcela_atual")) else None,
+                        parcela_total=int(row.get("parcela_total")) if pd.notna(row.get("parcela_total")) else None,
+                    )
+                )
+
+            inserted = insert_statement_lines(statement_id, competencia, lines)
+            st.success(f"✅ Salvo! {inserted} linha(s) nova(s) inserida(s).")
 
 
 def render_history_section():
@@ -318,10 +383,12 @@ def render_dashboard_section():
 # --- NAVEGAÇÃO ---
 with st.sidebar:
     st.title("🚀 Extrator Pro")
-    aba = st.radio("Navegação", ["Início", "Histórico", "Dashboard"])
+    aba = st.radio("Navegação", ["Início", "Faturas", "Histórico", "Dashboard"])
 
 if aba == "Início":
     render_upload_section()
+elif aba == "Faturas":
+    render_ofx_import()
 elif aba == "Dashboard":
     render_dashboard_section()
 else:
