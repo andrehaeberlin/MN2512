@@ -124,6 +124,11 @@ def render_upload_section():
 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
+                    with st.spinner(f"Registrando documento {arq.name}..."):
+                        file_bytes = arq.getvalue()
+                        mime = arq.type or "application/octet-stream"
+                        document_id = insert_document(arq.name, mime, file_bytes)
+
                     with st.spinner(f"Extraindo dados de {arq.name}..."):
                         texto_total = ""
                         if extensao == "pdf":
