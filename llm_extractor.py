@@ -1,13 +1,16 @@
 import json
 import os
-import urllib.request
+import time
 import urllib.error
+import urllib.request
+
+
+MAX_RETRIES = 3
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
 
 def _parse_json_content(content):
-    """
-    Faz parsing tolerante de JSON, incluindo respostas com markdown code fence.
-    """
+    """Faz parsing tolerante de JSON, incluindo respostas com markdown code fence."""
     texto = content.strip()
     if texto.startswith("```"):
         linhas = texto.splitlines()
@@ -17,6 +20,13 @@ def _parse_json_content(content):
             linhas = linhas[:-1]
         texto = "\n".join(linhas).strip()
     return json.loads(texto)
+
+
+def _shrink_text(texto, head=15000, tail=5000):
+    t = (texto or "").strip()
+    if len(t) <= head + tail:
+        return t
+    return t[:head] + "\n...\n" + t[-tail:]
 
 
 def _post_chat_completion(api_base, api_key, payload, timeout=30):
@@ -34,6 +44,27 @@ def _post_chat_completion(api_base, api_key, payload, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _call_llm_with_retry(api_base, api_key, payload, timeout=30):
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return _post_chat_completion(api_base, api_key, payload, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in RETRYABLE_HTTP and attempt < MAX_RETRIES:
+                time.sleep(2 ** (attempt - 1))
+                continue
+            raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** (attempt - 1))
+                continue
+            raise
+    if last_error:
+        raise last_error
+
+
 def extrair_dados_financeiros_llm(texto_bruto):
     """
     Faz fallback de extração usando um LLM quando o regex falhar.
@@ -48,13 +79,14 @@ def extrair_dados_financeiros_llm(texto_bruto):
 
     api_base = os.getenv("LLM_API_BASE", "https://api.openai.com/v1/chat/completions")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    texto_reduzido = _shrink_text(texto_bruto)
 
     prompt = (
         "Extraia transações financeiras do texto abaixo. "
         "Retorne SOMENTE um JSON válido no formato de lista de objetos, "
         "cada objeto com as chaves: data (YYYY-MM-DD), valor (float) e descricao (string). "
-        "Se não houver dados, retorne uma lista vazia [].\n\n"
-        f"Texto:\n{texto_bruto}"
+        "Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
+        f"Texto:\n{texto_reduzido}"
     )
 
     payload = {
@@ -67,7 +99,7 @@ def extrair_dados_financeiros_llm(texto_bruto):
     }
 
     try:
-        data = _post_chat_completion(api_base, api_key, payload, timeout=30)
+        data = _call_llm_with_retry(api_base, api_key, payload, timeout=30)
     except urllib.error.HTTPError as exc:
         return [], f"Erro na API LLM: {exc.code} - {exc.reason}"
     except urllib.error.URLError as exc:
@@ -75,12 +107,7 @@ def extrair_dados_financeiros_llm(texto_bruto):
     except Exception as exc:
         return [], f"Erro inesperado no LLM: {str(exc)}"
 
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     if not content:
         return [], "Resposta vazia do LLM."
 
@@ -111,13 +138,14 @@ def categorizar_transacoes_llm(transacoes):
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     categorias_validas = ["Alimentação", "Transporte", "Serviços", "Outros"]
 
+    transacoes_json = _shrink_text(json.dumps(transacoes, ensure_ascii=False), head=12000, tail=3000)
     prompt = (
         "Classifique cada transação em UMA categoria dentre: "
         f"{', '.join(categorias_validas)}. "
         "Retorne SOMENTE um JSON válido com uma lista de objetos no formato: "
         "[{\"index\": 0, \"categoria\": \"Outros\"}]. "
-        "Não altere índices e não retorne texto adicional.\n\n"
-        f"Transações (JSON):\n{json.dumps(transacoes, ensure_ascii=False)}"
+        "Se não conseguir classificar, retorne [] e não retorne texto adicional.\n\n"
+        f"Transações (JSON):\n{transacoes_json}"
     )
 
     payload = {
@@ -136,7 +164,7 @@ def categorizar_transacoes_llm(transacoes):
     }
 
     try:
-        data = _post_chat_completion(api_base, api_key, payload, timeout=30)
+        data = _call_llm_with_retry(api_base, api_key, payload, timeout=30)
     except urllib.error.HTTPError as exc:
         return transacoes, f"Erro na API LLM (categorização): {exc.code} - {exc.reason}"
     except urllib.error.URLError as exc:
@@ -144,12 +172,7 @@ def categorizar_transacoes_llm(transacoes):
     except Exception as exc:
         return transacoes, f"Erro inesperado no LLM (categorização): {str(exc)}"
 
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     if not content:
         return transacoes, "Resposta vazia do LLM na categorização."
 
