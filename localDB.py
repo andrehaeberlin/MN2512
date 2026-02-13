@@ -26,8 +26,9 @@ def init_db():
                 valor REAL NOT NULL,
                 fonte TEXT NOT NULL,
                 categoria TEXT,
+                tipo TEXT NOT NULL DEFAULT 'saida',
                 criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(data, descricao, valor, fonte)
+                UNIQUE(data, descricao, valor, fonte, tipo)
             );
             """
         )
@@ -37,6 +38,11 @@ def init_db():
         colunas = [row[1] for row in conn.execute("PRAGMA table_info(transacoes)").fetchall()]
         if "document_id" not in colunas:
             conn.execute("ALTER TABLE transacoes ADD COLUMN document_id INTEGER;")
+        if "tipo" not in colunas:
+            conn.execute("ALTER TABLE transacoes ADD COLUMN tipo TEXT NOT NULL DEFAULT 'saida';")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tipo_data ON transacoes(tipo, data);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_categoria_data ON transacoes(categoria, data);")
 
         conn.execute(
             """
@@ -151,11 +157,11 @@ def link_entities(from_type: str, from_id: int, to_type: str, to_id: int) -> Non
         )
 
 
-def find_transaction_id(data: str, descricao: str, valor: float, fonte: str) -> Optional[int]:
+def find_transaction_id(data: str, descricao: str, valor: float, fonte: str, tipo: str = "saida") -> Optional[int]:
     with sqlite3.connect(DB_NAME) as conn:
         row = conn.execute(
-            "SELECT id FROM transacoes WHERE data = ? AND descricao = ? AND valor = ? AND fonte = ?",
-            (data, descricao, float(valor), fonte),
+            "SELECT id FROM transacoes WHERE data = ? AND descricao = ? AND valor = ? AND fonte = ? AND tipo = ?",
+            (data, descricao, float(valor), fonte, tipo),
         ).fetchone()
     return int(row[0]) if row else None
 
@@ -170,21 +176,29 @@ def insert_transactions(df: pd.DataFrame):
     if "data" in df_final.columns:
         df_final["data"] = df_final["data"].fillna(datetime.now().strftime("%Y-%m-%d"))
 
-    colunas_obrigatorias = ["data", "descricao", "valor", "fonte", "categoria"]
+    colunas_obrigatorias = ["data", "descricao", "valor", "fonte", "categoria", "tipo"]
 
     for col in colunas_obrigatorias:
         if col not in df_final.columns:
-            df_final[col] = "" if col != "valor" else 0.0
+            if col == "valor":
+                df_final[col] = 0.0
+            elif col == "tipo":
+                df_final[col] = "saida"
+            else:
+                df_final[col] = ""
 
     df_final = df_final[colunas_obrigatorias]
+    df_final["valor"] = pd.to_numeric(df_final["valor"], errors="coerce").fillna(0.0).abs()
+    df_final["tipo"] = df_final["tipo"].astype(str).str.lower().str.strip()
+    df_final.loc[~df_final["tipo"].isin(["entrada", "saida"]), "tipo"] = "saida"
 
     try:
         with sqlite3.connect(DB_NAME) as conn:
             df_final.to_sql("staging_transacoes", conn, if_exists="replace", index=False)
 
             query_upsert = """
-            INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria)
-            SELECT data, descricao, valor, fonte, categoria FROM staging_transacoes;
+            INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria, tipo)
+            SELECT data, descricao, valor, fonte, categoria, tipo FROM staging_transacoes;
             """
             cursor = conn.execute(query_upsert)
             novas_linhas = cursor.rowcount

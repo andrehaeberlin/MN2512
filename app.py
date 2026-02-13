@@ -29,7 +29,7 @@ st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide
 
 # --- INICIALIZAÇÃO DO ESTADO ---
 if "dados_para_revisar" not in st.session_state:
-    st.session_state.dados_para_revisar = pd.DataFrame(columns=["data", "valor", "descricao"])
+    st.session_state.dados_para_revisar = pd.DataFrame(columns=["data", "valor", "descricao", "tipo"])
 if "ofx_preview_df" not in st.session_state:
     st.session_state.ofx_preview_df = pd.DataFrame()
 if "ofx_doc_id" not in st.session_state:
@@ -38,7 +38,7 @@ if "ofx_doc_id" not in st.session_state:
 
 def limpar_buffer():
     """Limpa os dados da área de preview e recarrega a página."""
-    st.session_state.dados_para_revisar = pd.DataFrame(columns=["data", "valor", "descricao"])
+    st.session_state.dados_para_revisar = pd.DataFrame(columns=["data", "valor", "descricao", "tipo"])
     st.rerun()
 
 
@@ -120,7 +120,7 @@ def render_upload_section():
 
                             df_plan["document_id"] = document_id
 
-                            novos_dados.append(df_plan[["data", "valor", "descricao", "fonte", "categoria", "document_id"]])
+                            novos_dados.append(df_plan[["data", "valor", "descricao", "fonte", "categoria", "tipo", "document_id"]])
 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
@@ -179,6 +179,8 @@ def render_upload_section():
 
                         df_extraido["fonte"] = arq.name
                         df_extraido["document_id"] = document_id
+                        if "tipo" not in df_extraido.columns:
+                            df_extraido["tipo"] = "saida"
                         if "categoria" not in df_extraido.columns:
                             df_extraido["categoria"] = "Outros"
                         df_extraido["categoria"] = df_extraido["categoria"].fillna("Outros")
@@ -214,6 +216,7 @@ def render_upload_section():
                 ),
                 "fonte": st.column_config.TextColumn("Fonte", disabled=True, width="small"),
                 "document_id": st.column_config.NumberColumn("Doc ID", disabled=True, width="small"),
+                "tipo": st.column_config.SelectboxColumn("Tipo", options=["saida", "entrada"], required=True),
             },
         )
 
@@ -232,9 +235,11 @@ def render_upload_section():
 
                         erros_impeditivos = []
                         avisos = []
-
-                        if (df_final["valor"] < 0).any():
-                            erros_impeditivos.append("❌ Existem valores negativos. Corrija para prosseguir.")
+                        df_final["valor"] = df_final["valor"].abs()
+                        if "tipo" not in df_final.columns:
+                            df_final["tipo"] = "saida"
+                        df_final["tipo"] = df_final["tipo"].astype(str).str.lower().str.strip()
+                        df_final.loc[~df_final["tipo"].isin(["entrada", "saida"]), "tipo"] = "saida"
 
                         datas_futuras = df_final["data"].dt.date > datetime.date.today()
                         if datas_futuras.fillna(False).any():
@@ -259,7 +264,11 @@ def render_upload_section():
                                 doc_id = row.get("document_id")
                                 if pd.notna(doc_id):
                                     tx_id = find_transaction_id(
-                                        row["data"], row["descricao"], float(row["valor"]), row["fonte"]
+                                        row["data"],
+                                        row["descricao"],
+                                        float(row["valor"]),
+                                        row["fonte"],
+                                        row.get("tipo", "saida"),
                                     )
                                     if tx_id:
                                         link_entities("transaction", tx_id, "document", int(doc_id))
