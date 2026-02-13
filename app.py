@@ -1,5 +1,6 @@
 import base64
 import datetime
+import io
 
 import pandas as pd
 import streamlit as st
@@ -42,7 +43,7 @@ def limpar_buffer():
 
 
 def render_preview(arq):
-    """Renderiza preview de imagens e PDFs antes do processamento."""
+    """Renderiza preview de imagens, PDFs e planilhas antes do processamento."""
     extensao = arq.name.split(".")[-1].lower()
 
     if extensao in ["png", "jpg", "jpeg"]:
@@ -63,6 +64,17 @@ def render_preview(arq):
             """,
             height=650,
         )
+        return
+
+    if extensao in ["csv", "xlsx"]:
+        try:
+            if extensao == "csv":
+                df_preview = pd.read_csv(io.BytesIO(arq.getvalue()))
+            else:
+                df_preview = pd.read_excel(io.BytesIO(arq.getvalue()))
+            st.dataframe(df_preview.head(50), use_container_width=True)
+        except Exception as exc:
+            st.warning(f"Não foi possível renderizar preview tabular: {exc}")
         return
 
     st.info("Formato sem preview incorporado.")
@@ -91,6 +103,11 @@ def render_upload_section():
                 extensao = arq.name.split(".")[-1].lower()
                 document_id = None
 
+                with st.spinner(f"Registrando documento {arq.name}..."):
+                    file_bytes = arq.getvalue()
+                    mime = arq.type or "application/octet-stream"
+                    document_id = insert_document(arq.name, mime, file_bytes)
+
                 # 1. Processamento de Planilhas
                 if extensao in ["xlsx", "csv"]:
                     with st.spinner(f"Processando planilha {arq.name}..."):
@@ -101,7 +118,9 @@ def render_upload_section():
                             if "categoria" not in df_plan.columns:
                                 df_plan["categoria"] = "Outros"
 
-                            novos_dados.append(df_plan[["data", "valor", "descricao", "fonte", "categoria"]])
+                            df_plan["document_id"] = document_id
+
+                            novos_dados.append(df_plan[["data", "valor", "descricao", "fonte", "categoria", "document_id"]])
 
                 # 2. Processamento de PDFs e Imagens (OCR + Regex)
                 else:
