@@ -1,30 +1,35 @@
-# ============================================================
-# FILE: ocr.py
-# ============================================================
-import easyocr
-import cv2
-import numpy as np
 import time
 from functools import lru_cache
-from PIL import Image
-import io
+from typing import Iterable, Sequence
 
-@lru_cache(maxsize=2)
-def obter_leitor_ocr(idiomas=("pt",), gpu=False):
-    """
-    Inicializa e mantém em cache o leitor do EasyOCR.
+import cv2
+import easyocr
+import numpy as np
+from PIL import Image, ImageOps
 
-    Isso evita recarregar modelos a cada rerun do Streamlit.
-    """
+
+@lru_cache(maxsize=4)
+def obter_leitor_ocr(idiomas: Sequence[str] = ("pt", "en"), gpu: bool = False):
+    """Inicializa e mantém em cache o leitor do EasyOCR."""
     return easyocr.Reader(list(idiomas), gpu=gpu)
 
-def preprocessar_imagem_ocr(img_np):
-    """
-    Aplica pré-processamento para melhorar a qualidade do OCR.
-    """
+
+def _resize_max(img_np: np.ndarray, max_w: int = 1800) -> np.ndarray:
+    h, w = img_np.shape[:2]
+    if w <= max_w:
+        return img_np
+
+    scale = max_w / float(w)
+    nh = int(h * scale)
+    return cv2.resize(img_np, (max_w, nh), interpolation=cv2.INTER_AREA)
+
+
+def preprocessar_imagem_ocr(img_np: np.ndarray) -> np.ndarray:
+    """Aplica pré-processamento amigável para OCR de recibos/notas."""
     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    img_denoised = cv2.fastNlMeansDenoising(img_gray, h=30)
-    img_eq = cv2.equalizeHist(img_denoised)
+    img_denoised = cv2.fastNlMeansDenoising(img_gray, h=15)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_eq = clahe.apply(img_denoised)
     img_thresh = cv2.adaptiveThreshold(
         img_eq,
         255,
@@ -35,43 +40,52 @@ def preprocessar_imagem_ocr(img_np):
     )
     return img_thresh
 
-def extrair_texto_imagem(arquivo_imagem):
-    """
-    Processa uma imagem e extrai o texto utilizando EasyOCR.
-    
-    Args:
-        arquivo_imagem: Objeto do arquivo (BytesIO do Streamlit)
-        
-    Returns:
-        tuple: (texto_extraido, tempo_processamento, erro)
-    """
+
+def _join_with_conf(resultados: Iterable, min_conf: float = 0.35) -> str:
+    partes = []
+    for item in resultados:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+
+        texto = str(item[1]).strip()
+        conf = float(item[2]) if item[2] is not None else 0.0
+        if texto and conf >= min_conf:
+            partes.append(texto)
+
+    return " ".join(partes).strip()
+
+
+def extrair_texto_imagem(arquivo_imagem, idiomas: Sequence[str] = ("pt", "en"), gpu: bool = False):
+    """Processa imagem e extrai texto usando EasyOCR com fallback inteligente."""
     try:
         inicio = time.time()
-        
-        # 1. Converter buffer do Streamlit para imagem OpenCV
-        # Primeiro lemos com PIL e depois convertemos para array numpy
-        img_pil = Image.open(arquivo_imagem)
-        img_np = np.array(img_pil)
-        
-        # 2. Execução do OCR (Critério: Suporte a Idiomas/Português)
-        # detail=0 retorna apenas o texto bruto consolidado
-        reader = obter_leitor_ocr()
-        resultados = reader.readtext(img_np, detail=0)
 
-        # 3. Fallback: aplicar pré-processamento apenas se necessário
-        if not resultados:
+        img_pil = Image.open(arquivo_imagem)
+        img_pil = ImageOps.exif_transpose(img_pil)
+        img_pil = img_pil.convert("RGB")
+
+        img_np = np.array(img_pil)
+        img_np = _resize_max(img_np, max_w=1800)
+
+        reader = obter_leitor_ocr(tuple(idiomas), gpu=gpu)
+
+        resultados = reader.readtext(img_np, detail=1)
+        texto_total = _join_with_conf(resultados, min_conf=0.35)
+
+        digits = sum(c.isdigit() for c in texto_total)
+        if (not texto_total) or (len(texto_total) < 40) or (digits < 6):
             img_preprocessada = preprocessar_imagem_ocr(img_np)
-            resultados = reader.readtext(img_preprocessada, detail=0)
-        texto_total = " ".join(str(item) for item in resultados)
-        
-        fim = time.time()
-        tempo_total = fim - inicio
-        
-        # 4. Logs de Execução (Critério: Monitorar performance)
+            resultados_pre = reader.readtext(img_preprocessada, detail=1)
+            texto_pre = _join_with_conf(resultados_pre, min_conf=0.30)
+            if len(texto_pre) > len(texto_total):
+                texto_total = texto_pre
+
+        tempo_total = time.time() - inicio
+
         nome_arquivo = getattr(arquivo_imagem, "name", "BytesIO")
-        print(f" [OCR] Arquivo: {nome_arquivo} | Tempo: {tempo_total:.2f}s")
-        
+        print(f"[OCR] Arquivo: {nome_arquivo} | Tempo: {tempo_total:.2f}s | Len: {len(texto_total)}")
+
         return texto_total, tempo_total, None
 
-    except Exception as e:
-        return "", 0, f"Erro no motor de OCR: {str(e)}"
+    except Exception as exc:
+        return "", 0, f"Erro no motor de OCR: {str(exc)}"
