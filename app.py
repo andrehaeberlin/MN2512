@@ -1,4 +1,5 @@
 import base64
+import datetime
 import io
 import json
 
@@ -16,6 +17,7 @@ from localDB import (
     init_ingest_db,
     list_ingest_documents,
     process_stored_documents,
+    insert_transactions,
     store_raw_document,
     submit_hitl_review,
 )
@@ -164,12 +166,133 @@ def render_history_section():
     st.dataframe(df_historico.sort_values("data", ascending=False), use_container_width=True, hide_index=True)
 
 
+def render_income_entry():
+    st.title("💸 Entrada de Receitas")
+
+    st.caption("Registre entradas manualmente. Isso vai direto para o banco como transação do tipo 'entrada'.")
+
+    hoje = datetime.date.today()
+    categorias = ["Salário", "Freelance", "Reembolso", "Investimentos", "Venda", "Outros"]
+
+    with st.form("form_receita", clear_on_submit=True):
+        col1, col2, col3 = st.columns([1, 1, 2])
+
+        with col1:
+            data = st.date_input("Data", value=hoje)
+
+        with col2:
+            valor = st.number_input("Valor (R$)", min_value=0.0, step=10.0, format="%.2f")
+
+        with col3:
+            descricao = st.text_input("Descrição", placeholder="Ex: Salário empresa X / Pix recebido / Reembolso")
+
+        col4, col5 = st.columns([1, 1])
+        with col4:
+            categoria = st.selectbox("Categoria", categorias, index=0)
+        with col5:
+            fonte = st.text_input("Fonte (opcional)", placeholder="Ex: Manual / Banco X / Cliente Y")
+
+        submitted = st.form_submit_button("💾 Salvar Receita", type="primary")
+
+    if submitted:
+        if not descricao or not descricao.strip():
+            st.error("Descrição é obrigatória.")
+            return
+        if valor <= 0:
+            st.error("Valor precisa ser maior que zero.")
+            return
+
+        df = pd.DataFrame(
+            [
+                {
+                    "data": pd.Timestamp(data).strftime("%Y-%m-%d"),
+                    "valor": float(valor),
+                    "descricao": descricao.strip(),
+                    "categoria": categoria,
+                    "fonte": (fonte.strip() if fonte and fonte.strip() else "Manual"),
+                    "tipo": "entrada",
+                }
+            ]
+        )
+
+        try:
+            insert_transactions(df)
+            st.success("✅ Receita salva com sucesso!")
+            st.toast("Receita registrada.", icon="✅")
+        except Exception as exc:
+            st.error(f"Falha ao salvar receita: {exc}")
+
+    st.divider()
+    st.subheader("📥 Entrada rápida (múltiplas receitas)")
+
+    if "receitas_buffer" not in st.session_state:
+        st.session_state.receitas_buffer = pd.DataFrame(
+            columns=["data", "valor", "descricao", "categoria", "fonte", "tipo"]
+        )
+
+    df_edit = st.data_editor(
+        st.session_state.receitas_buffer,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", required=True),
+            "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f", required=True),
+            "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=categorias, required=True),
+            "fonte": st.column_config.TextColumn("Fonte", width="medium"),
+            "tipo": st.column_config.TextColumn("Tipo", disabled=True),
+        },
+    )
+
+    if not df_edit.empty:
+        df_edit["tipo"] = "entrada"
+        df_edit["fonte"] = df_edit["fonte"].fillna("Manual").astype(str)
+        st.session_state.receitas_buffer = df_edit
+
+    c1, c2, _ = st.columns([1, 1, 2])
+    with c1:
+        if st.button("💾 Salvar Lote", disabled=st.session_state.receitas_buffer.empty):
+            df_final = st.session_state.receitas_buffer.copy()
+
+            df_final["descricao"] = df_final["descricao"].astype(str).str.strip()
+            df_final = df_final[df_final["descricao"].ne("")]
+
+            df_final["data"] = pd.to_datetime(df_final["data"], errors="coerce")
+            df_final["valor"] = pd.to_numeric(df_final["valor"], errors="coerce")
+
+            df_final = df_final.dropna(subset=["data", "valor"])
+            df_final = df_final[df_final["valor"] > 0]
+
+            if df_final.empty:
+                st.error("Nada válido para salvar (verifique data/valor/descrição).")
+                return
+
+            df_final["data"] = df_final["data"].dt.strftime("%Y-%m-%d")
+            df_final["tipo"] = "entrada"
+            df_final["categoria"] = df_final["categoria"].fillna("Outros")
+
+            try:
+                insert_transactions(df_final)
+                st.success(f"✅ Lote salvo: {len(df_final)} receita(s).")
+                st.toast("Receitas registradas.", icon="✅")
+                st.session_state.receitas_buffer = st.session_state.receitas_buffer.iloc[0:0]
+            except Exception as exc:
+                st.error(f"Falha ao salvar lote: {exc}")
+
+    with c2:
+        if st.button("🗑️ Limpar Lote"):
+            st.session_state.receitas_buffer = st.session_state.receitas_buffer.iloc[0:0]
+            st.toast("Lote limpo.", icon="🗑️")
+
+
 with st.sidebar:
     st.title("🚀 Extrator Pro")
-    aba = st.radio("Navegação", ["Importar", "Pipeline", "Revisão", "Finalização", "Histórico"])
+    aba = st.radio("Navegação", ["Importar", "Receitas", "Pipeline", "Revisão", "Finalização", "Histórico"])
 
 if aba == "Importar":
     render_import_store()
+elif aba == "Receitas":
+    render_income_entry()
 elif aba == "Pipeline":
     render_pipeline()
 elif aba == "Revisão":
