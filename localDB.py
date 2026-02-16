@@ -522,10 +522,11 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
         valor = float(item.get("valor", 0.0) or 0.0)
         total += valor
 
-        tipo = str(item.get("tipo") or "saida").strip().lower()
-        if tipo not in ["entrada", "saida"]:
-            tipo = "saida"
+        data = str(item.get("data") or "").strip()
+        descricao = str(item.get("descricao") or "").strip()
 
+        tipo_raw = str(item.get("tipo") or "").strip().lower()
+        tipo = tipo_raw if tipo_raw in ["entrada", "saida"] else "saida"
         if tipo == "entrada":
             entrada_count += 1
             entrada_total += valor
@@ -533,16 +534,34 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
             saida_count += 1
             saida_total += valor
 
-        data = str(item.get("data") or "")
-        if data:
+        if not tipo_raw:
+            issues.append({"index": idx, "rule": "missing_type", "detail": "Tipo ausente"})
+        elif tipo_raw not in ["entrada", "saida"]:
+            issues.append({"index": idx, "rule": "invalid_type", "detail": "Tipo inválido"})
+
+        if not data:
+            issues.append({"index": idx, "rule": "missing_date", "detail": "Data ausente"})
+        else:
             try:
                 parsed = datetime.strptime(data, "%Y-%m-%d").date()
                 if parsed > datetime.utcnow().date():
                     issues.append({"index": idx, "rule": "future_date", "detail": "Data futura detectada"})
             except ValueError:
                 issues.append({"index": idx, "rule": "invalid_date", "detail": "Data inválida"})
+
+        if not descricao:
+            issues.append({"index": idx, "rule": "missing_description", "detail": "Descrição ausente"})
+        elif len(descricao) > 180:
+            issues.append({"index": idx, "rule": "suspicious_description", "detail": "Descrição muito longa"})
+
+        desc_upper = descricao.upper()
+        if any(token in desc_upper for token in ["AUTENTICACAO", "TERMINAL", "PROTOCOLO"]):
+            issues.append({"index": idx, "rule": "description_noise", "detail": "Descrição contém ruído de comprovante"})
+
         if abs(valor) > 1_000_000:
             issues.append({"index": idx, "rule": "absurd_value", "detail": "Valor muito alto"})
+        if valor == 0:
+            issues.append({"index": idx, "rule": "zero_value", "detail": "Valor zerado"})
 
     logger.info(
         "[LLM_REVIEW] Verificação por tipo concluída. entradas=%s (total=%.2f) | saídas=%s (total=%.2f)",
