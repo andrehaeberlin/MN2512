@@ -31,7 +31,7 @@ st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide
 def render_preview(arq):
     ext = arq.name.split(".")[-1].lower()
     if ext in ["png", "jpg", "jpeg"]:
-        st.image(arq, use_container_width=True)
+        st.image(arq, width="stretch")
         return
     if ext == "pdf":
         b64 = base64.b64encode(arq.getvalue()).decode("utf-8")
@@ -48,7 +48,7 @@ def render_preview(arq):
                 df = pd.read_csv(io.BytesIO(arq.getvalue()))
             else:
                 df = pd.read_excel(io.BytesIO(arq.getvalue()))
-            st.dataframe(df.head(30), use_container_width=True)
+            st.dataframe(df.head(30), width="stretch")
         except Exception as exc:
             st.warning(f"Preview indisponível: {exc}")
         return
@@ -87,7 +87,7 @@ def render_pipeline():
     st.title("Pipeline")
     docs = list_ingest_documents([STATUS_STORED, STATUS_PROCESSING, STATUS_HITL_REVIEW])
     if docs:
-        st.dataframe(pd.DataFrame(docs), use_container_width=True)
+        st.dataframe(pd.DataFrame(docs), width="stretch")
     else:
         st.info("Sem documentos nesses estados.")
 
@@ -144,7 +144,7 @@ def render_finalize():
     st.title("FINALIZE")
     docs = list_ingest_documents([STATUS_FINALIZE_PENDING])
     if docs:
-        st.dataframe(pd.DataFrame(docs), use_container_width=True)
+        st.dataframe(pd.DataFrame(docs), width="stretch")
     else:
         st.info("Nenhum documento pendente de finalização.")
 
@@ -163,7 +163,7 @@ def render_history_section():
         st.info("Nenhum registro encontrado.")
         return
     df_historico["data"] = pd.to_datetime(df_historico["data"], errors="coerce")
-    st.dataframe(df_historico.sort_values("data", ascending=False), use_container_width=True, hide_index=True)
+    st.dataframe(df_historico.sort_values("data", ascending=False), width="stretch", hide_index=True)
 
 
 def render_income_entry():
@@ -233,7 +233,7 @@ def render_income_entry():
     df_edit = st.data_editor(
         st.session_state.receitas_buffer,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "data": st.column_config.DateColumn("Data", format="DD/MM/YYYY", required=True),
             "valor": st.column_config.NumberColumn("Valor (R$)", format="%.2f", required=True),
