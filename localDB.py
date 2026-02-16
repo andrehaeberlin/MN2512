@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -26,6 +27,11 @@ STATUS_FINALIZE_PENDING = "FINALIZE_PENDING"
 STATUS_FINALIZED = "FINALIZED"
 STATUS_ERROR_STORAGE = "ERROR_STORAGE"
 STATUS_ERROR_PROCESSING = "ERROR_PROCESSING"
+
+logger = logging.getLogger(__name__)
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
 
 def init_db():
@@ -478,11 +484,29 @@ def _save_text_artifact(document_id: str, doc_sha: str, kind: str, relative_path
 
 
 def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
+    logger.info("[LLM_REVIEW] Iniciando validações automáticas para %s transação(ões).", len(payload))
     issues = []
     total = 0.0
+    entrada_count = 0
+    saida_count = 0
+    entrada_total = 0.0
+    saida_total = 0.0
+
     for idx, item in enumerate(payload):
         valor = float(item.get("valor", 0.0) or 0.0)
         total += valor
+
+        tipo = str(item.get("tipo") or "saida").strip().lower()
+        if tipo not in ["entrada", "saida"]:
+            tipo = "saida"
+
+        if tipo == "entrada":
+            entrada_count += 1
+            entrada_total += valor
+        else:
+            saida_count += 1
+            saida_total += valor
+
         data = str(item.get("data") or "")
         if data:
             try:
@@ -494,12 +518,32 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
         if abs(valor) > 1_000_000:
             issues.append({"index": idx, "rule": "absurd_value", "detail": "Valor muito alto"})
 
-    return {
+    logger.info(
+        "[LLM_REVIEW] Verificação por tipo concluída. entradas=%s (total=%.2f) | saídas=%s (total=%.2f)",
+        entrada_count,
+        entrada_total,
+        saida_count,
+        saida_total,
+    )
+
+    result = {
         "passed": len(issues) == 0,
         "confidence": 0.95 if not issues else 0.60,
         "issues": issues,
-        "summary": {"count": len(payload), "sum_valor": total},
+        "summary": {
+            "count": len(payload),
+            "sum_valor": total,
+            "entrada": {"count": entrada_count, "sum_valor": entrada_total},
+            "saida": {"count": saida_count, "sum_valor": saida_total},
+        },
     }
+    logger.info(
+        "[LLM_REVIEW] Validações concluídas. passed=%s confidence=%.2f issues=%s",
+        result["passed"],
+        result["confidence"],
+        len(issues),
+    )
+    return result
 
 
 def _record_extraction(document_id: str, extractor: str, payload_uri: str, confidence: float, llm_checks_uri: str) -> None:
@@ -539,6 +583,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
         return False, "SHA divergente do raw."
 
     _update_ingest_status(document_id, STATUS_PROCESSING)
+    logger.info("[PIPELINE] Documento %s (%s) movido para PROCESSING.", document_id, original_name)
 
     try:
         text_content = ""
@@ -583,10 +628,14 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
             _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
             payload = extrair_dados_financeiros(text_content)
             if not payload:
+                logger.info("[PIPELINE] Regex sem resultado para %s. Iniciando extração via LLM.", document_id)
                 payload, llm_err = extrair_dados_financeiros_llm(text_content)
                 extractor = "llm" if not llm_err else "regex"
                 if llm_err and not payload:
+                    logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
                     payload = []
+                elif not llm_err:
+                    logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
         else:
             upload = _UploadWrap(raw_bytes, original_name, mime)
             txt, _, ocr_err = extrair_texto_imagem(upload)
@@ -596,10 +645,14 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
             _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
             payload = extrair_dados_financeiros(text_content)
             if not payload:
+                logger.info("[PIPELINE] Regex sem resultado para %s. Iniciando extração via LLM.", document_id)
                 payload, llm_err = extrair_dados_financeiros_llm(text_content)
                 extractor = "llm" if not llm_err else "regex"
                 if llm_err and not payload:
+                    logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
                     payload = []
+                elif not llm_err:
+                    logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
 
         payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
         checks_uri = os.path.join("data", "artifacts", sha, "extraction", "llm_checks.json")
@@ -610,12 +663,22 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
         _save_text_artifact(document_id, sha, "extracted_json", "extraction/candidate.json", json.dumps(payload, ensure_ascii=False), meta={"extractor": extractor})
         _save_text_artifact(document_id, sha, "llm_checks", "extraction/llm_checks.json", json.dumps(checks, ensure_ascii=False), meta={"extractor": "checks"})
         _record_extraction(document_id, extractor, payload_uri, checks["confidence"], checks_uri)
+        logger.info(
+            "[PIPELINE] Documento %s processado. extractor=%s payload_items=%s confidence=%.2f",
+            document_id,
+            extractor,
+            len(payload),
+            checks["confidence"],
+        )
 
         _update_ingest_status(document_id, STATUS_LLM_REVIEW)
+        logger.info("[LLM_REVIEW] Documento %s movido para LLM_REVIEW.", document_id)
         _update_ingest_status(document_id, STATUS_HITL_REVIEW)
+        logger.info("[LLM_REVIEW] Documento %s movido para HITL_REVIEW.", document_id)
         return True, "Pipeline concluída e enviado para HITL_REVIEW."
     except Exception as exc:
         _update_ingest_status(document_id, STATUS_ERROR_PROCESSING, str(exc))
+        logger.exception("[PIPELINE] Falha no processamento do documento %s.", document_id)
         return False, str(exc)
 
 
