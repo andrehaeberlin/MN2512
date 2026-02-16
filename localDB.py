@@ -483,6 +483,32 @@ def _save_text_artifact(document_id: str, doc_sha: str, kind: str, relative_path
     return _save_artifact(document_id, doc_sha, kind, relative_path, text.encode("utf-8"), meta=meta)
 
 
+def _is_low_quality_payload(payload: List[Dict[str, Any]]) -> bool:
+    """Heurística para detectar extrações pobres e tentar refinamento por LLM."""
+    if not payload:
+        return True
+
+    low_quality = 0
+    for item in payload:
+        data = str(item.get("data") or "").strip()
+        descricao = str(item.get("descricao") or "").strip()
+
+        # data ausente/inválida
+        if not data:
+            low_quality += 1
+        else:
+            try:
+                datetime.strptime(data, "%Y-%m-%d")
+            except ValueError:
+                low_quality += 1
+
+        # descrição muito longa costuma indicar OCR bruto sem limpeza
+        if len(descricao) > 120:
+            low_quality += 1
+
+    return low_quality > 0
+
+
 def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     logger.info("[LLM_REVIEW] Iniciando validações automáticas para %s transação(ões).", len(payload))
     issues = []
@@ -627,14 +653,23 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
 
             _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
             payload = extrair_dados_financeiros(text_content)
-            if not payload:
-                logger.info("[PIPELINE] Regex sem resultado para %s. Iniciando extração via LLM.", document_id)
-                payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                extractor = "llm" if not llm_err else "regex"
-                if llm_err and not payload:
+            needs_llm_refine = _is_low_quality_payload(payload)
+            if not payload or needs_llm_refine:
+                motivo = "sem resultado" if not payload else "qualidade baixa"
+                logger.info(
+                    "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
+                    motivo,
+                    document_id,
+                )
+                llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
+                if llm_err and not llm_payload and not payload:
                     logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
                     payload = []
-                elif not llm_err:
+                elif llm_err and payload:
+                    logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
+                elif llm_payload:
+                    payload = llm_payload
+                    extractor = "llm"
                     logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
         else:
             upload = _UploadWrap(raw_bytes, original_name, mime)
@@ -644,14 +679,23 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
             text_content = txt
             _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
             payload = extrair_dados_financeiros(text_content)
-            if not payload:
-                logger.info("[PIPELINE] Regex sem resultado para %s. Iniciando extração via LLM.", document_id)
-                payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                extractor = "llm" if not llm_err else "regex"
-                if llm_err and not payload:
+            needs_llm_refine = _is_low_quality_payload(payload)
+            if not payload or needs_llm_refine:
+                motivo = "sem resultado" if not payload else "qualidade baixa"
+                logger.info(
+                    "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
+                    motivo,
+                    document_id,
+                )
+                llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
+                if llm_err and not llm_payload and not payload:
                     logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
                     payload = []
-                elif not llm_err:
+                elif llm_err and payload:
+                    logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
+                elif llm_payload:
+                    payload = llm_payload
+                    extractor = "llm"
                     logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
 
         payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
