@@ -82,10 +82,14 @@ def extrair_dados_financeiros_llm(texto_bruto):
     texto_reduzido = _shrink_text(texto_bruto)
 
     prompt = (
-        "Extraia transações financeiras do texto abaixo. "
-        "Retorne SOMENTE um JSON válido no formato de lista de objetos, "
-        "cada objeto com as chaves: data (YYYY-MM-DD), valor (float) e descricao (string). "
-        "Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
+        "Extraia transações financeiras do texto OCR abaixo. "
+        "Retorne SOMENTE um JSON válido no formato de lista de objetos. "
+        "Cada objeto deve conter: data (YYYY-MM-DD), valor (float), descricao (string curta e limpa) e tipo ('entrada' ou 'saida'). "
+        "Regras: "
+        "1) Normalize datas como DD/MM/AAAA para YYYY-MM-DD; "
+        "2) Não inclua texto de autenticação/terminal/protocolo na descricao; "
+        "3) Se detectar pagamento/compra, use tipo='saida'; se detectar recebimento/credito, use tipo='entrada'; "
+        "4) Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
         f"Texto:\n{texto_reduzido}"
     )
 
