@@ -487,9 +487,26 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     logger.info("[LLM_REVIEW] Iniciando validações automáticas para %s transação(ões).", len(payload))
     issues = []
     total = 0.0
+    entrada_count = 0
+    saida_count = 0
+    entrada_total = 0.0
+    saida_total = 0.0
+
     for idx, item in enumerate(payload):
         valor = float(item.get("valor", 0.0) or 0.0)
         total += valor
+
+        tipo = str(item.get("tipo") or "saida").strip().lower()
+        if tipo not in ["entrada", "saida"]:
+            tipo = "saida"
+
+        if tipo == "entrada":
+            entrada_count += 1
+            entrada_total += valor
+        else:
+            saida_count += 1
+            saida_total += valor
+
         data = str(item.get("data") or "")
         if data:
             try:
@@ -501,11 +518,24 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
         if abs(valor) > 1_000_000:
             issues.append({"index": idx, "rule": "absurd_value", "detail": "Valor muito alto"})
 
+    logger.info(
+        "[LLM_REVIEW] Verificação por tipo concluída. entradas=%s (total=%.2f) | saídas=%s (total=%.2f)",
+        entrada_count,
+        entrada_total,
+        saida_count,
+        saida_total,
+    )
+
     result = {
         "passed": len(issues) == 0,
         "confidence": 0.95 if not issues else 0.60,
         "issues": issues,
-        "summary": {"count": len(payload), "sum_valor": total},
+        "summary": {
+            "count": len(payload),
+            "sum_valor": total,
+            "entrada": {"count": entrada_count, "sum_valor": entrada_total},
+            "saida": {"count": saida_count, "sum_valor": saida_total},
+        },
     }
     logger.info(
         "[LLM_REVIEW] Validações concluídas. passed=%s confidence=%.2f issues=%s",
