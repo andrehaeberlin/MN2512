@@ -7,6 +7,8 @@ import urllib.request
 
 MAX_RETRIES = 3
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+DOCUMENT_TYPES = {"Entrada", "Saída", "Extrato", "Fatura"}
+DEFAULT_DOCUMENT_TYPE = "Extrato"
 
 
 def _parse_json_content(content):
@@ -69,6 +71,8 @@ def extrair_dados_financeiros_llm(texto_bruto):
     """
     Faz fallback de extração usando um LLM quando o regex falhar.
     Retorna (lista_de_dados, erro).
+    Cada item inclui o campo `document_type` com uma das classes:
+    Entrada, Saída, Extrato ou Fatura.
     """
     if not texto_bruto:
         return [], "Texto vazio para extração via LLM."
@@ -82,21 +86,29 @@ def extrair_dados_financeiros_llm(texto_bruto):
     texto_reduzido = _shrink_text(texto_bruto)
 
     prompt = (
-        "Extraia transações financeiras do texto OCR abaixo. "
+        "Extraia transações financeiras do texto OCR abaixo e classifique o documento inteiro. "
         "Retorne SOMENTE um JSON válido no formato de lista de objetos. "
-        "Cada objeto deve conter: data (YYYY-MM-DD), valor (float), descricao (string curta e limpa) e tipo ('entrada' ou 'saida'). "
+        "Cada objeto deve conter: data (YYYY-MM-DD), valor (float), descricao (string curta e limpa), tipo ('entrada' ou 'saida') e document_type ('Entrada', 'Saída', 'Extrato' ou 'Fatura'). "
         "Regras: "
         "1) Normalize datas como DD/MM/AAAA para YYYY-MM-DD; "
         "2) Não inclua texto de autenticação/terminal/protocolo na descricao; "
         "3) Se detectar pagamento/compra, use tipo='saida'; se detectar recebimento/credito, use tipo='entrada'; "
-        "4) Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
+        "4) O campo document_type deve refletir o tipo global do documento e se repetir em todos os itens; "
+        "5) Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
         f"Texto:\n{texto_reduzido}"
     )
 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "Você é um extrator de dados financeiros."},
+            {
+                "role": "system",
+                "content": (
+                    "Você é um extrator financeiro especialista em classificação documental. "
+                    "Classifique o documento como Entrada, Saída, Extrato ou Fatura e inclua "
+                    "o campo document_type em todos os itens de saída."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
@@ -123,7 +135,18 @@ def extrair_dados_financeiros_llm(texto_bruto):
     if not isinstance(parsed, list):
         return [], "Resposta do LLM não retornou uma lista."
 
-    return parsed, None
+    normalized = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        item_saida = dict(item)
+        document_type = str(item_saida.get("document_type") or DEFAULT_DOCUMENT_TYPE).strip().title()
+        if document_type not in DOCUMENT_TYPES:
+            document_type = DEFAULT_DOCUMENT_TYPE
+        item_saida["document_type"] = document_type
+        normalized.append(item_saida)
+
+    return normalized, None
 
 
 def categorizar_transacoes_llm(transacoes):
