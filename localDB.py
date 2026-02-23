@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -355,12 +355,6 @@ def _safe_name(filename: str) -> str:
     return os.path.basename(filename).replace(" ", "_") or "document.bin"
 
 
-def _write_bytes(path: str, content: bytes) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as handler:
-        handler.write(content)
-
-
 def _write_json(path: str, payload: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handler:
@@ -368,7 +362,15 @@ def _write_json(path: str, payload: Any) -> None:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_bytes(path: str, content: bytes) -> None:
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "wb") as handler:
+        handler.write(content)
 
 
 def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_root: str = "data") -> Dict[str, Any]:
@@ -484,16 +486,13 @@ def _save_text_artifact(document_id: str, doc_sha: str, kind: str, relative_path
 
 
 def _is_low_quality_payload(payload: List[Dict[str, Any]]) -> bool:
-    """Heurística para detectar extrações pobres e tentar refinamento por LLM."""
     if not payload:
         return True
-
     low_quality = 0
     for item in payload:
         data = str(item.get("data") or "").strip()
         descricao = str(item.get("descricao") or "").strip()
 
-        # data ausente/inválida
         if not data:
             low_quality += 1
         else:
@@ -502,11 +501,10 @@ def _is_low_quality_payload(payload: List[Dict[str, Any]]) -> bool:
             except ValueError:
                 low_quality += 1
 
-        # descrição muito longa costuma indicar OCR bruto sem limpeza
         if len(descricao) > 120:
             low_quality += 1
 
-    return low_quality > 0
+    return (low_quality / max(1, len(payload))) > 0.2
 
 
 def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -544,7 +542,7 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             try:
                 parsed = datetime.strptime(data, "%Y-%m-%d").date()
-                if parsed > datetime.utcnow().date():
+                if parsed > datetime.now(timezone.utc).date():
                     issues.append({"index": idx, "rule": "future_date", "detail": "Data futura detectada"})
             except ValueError:
                 issues.append({"index": idx, "rule": "invalid_date", "detail": "Data inválida"})

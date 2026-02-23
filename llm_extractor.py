@@ -3,7 +3,9 @@ import os
 import time
 import urllib.error
 import urllib.request
+from dotenv import load_dotenv
 
+load_dotenv()
 
 MAX_RETRIES = 3
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
