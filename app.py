@@ -12,6 +12,8 @@ from localDB import (
     STATUS_STORED,
     finalize_pending_documents,
     get_all_transactions,
+    get_document_items,
+    get_document_summaries,
     get_latest_extraction_payload,
     init_db,
     init_ingest_db,
@@ -158,6 +160,50 @@ def render_finalize():
 
 def render_history_section():
     st.title("📜 Histórico de Transações")
+    st.subheader("Notas/Documentos (resumo)")
+
+    df_resumos = get_document_summaries()
+    selected_doc_id = None
+    if df_resumos.empty:
+        st.info("Nenhum resumo de documento encontrado.")
+    else:
+        df_resumos_view = df_resumos.copy()
+        df_resumos_view["data_documento"] = pd.to_datetime(df_resumos_view["data_documento"], errors="coerce")
+        df_resumos_view["status_total"] = df_resumos_view["total_confere"].map({1: "✅ confere", 0: "❌ divergente"}).fillna("⚠️ sem total declarado")
+        st.dataframe(
+            df_resumos_view[
+                [
+                    "document_id",
+                    "fonte",
+                    "data_documento",
+                    "qtd_itens",
+                    "total_itens",
+                    "total_declarado",
+                    "status_total",
+                    "criado_em",
+                ]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+        options = ["Todos"] + df_resumos["document_id"].astype(str).tolist()
+        selected_doc_id = st.selectbox("Filtrar itens por documento", options=options, index=0)
+
+    st.subheader("Itens dos documentos")
+    filtro_doc = None if selected_doc_id in [None, "Todos"] else selected_doc_id
+    df_itens = get_document_items(filtro_doc)
+    if df_itens.empty:
+        st.info("Nenhum item de documento encontrado.")
+    else:
+        df_itens["data"] = pd.to_datetime(df_itens["data"], errors="coerce")
+        st.dataframe(
+            df_itens.sort_values(["document_id", "data", "id"], ascending=[False, False, False]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("Transações (legado/completo)")
     df_historico = get_all_transactions()
     if df_historico.empty:
         st.info("Nenhum registro encontrado.")
