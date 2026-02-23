@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -11,6 +12,120 @@ MAX_RETRIES = 3
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 DOCUMENT_TYPES = {"Entrada", "Saída", "Extrato", "Fatura"}
 DEFAULT_DOCUMENT_TYPE = "Extrato"
+RECEIPT_MARKERS = [
+    "documento aux. da nota fiscal",
+    "nota fiscal de consumidor eletr",
+    "qtd total de itens",
+    "valor liquido",
+]
+
+
+def _parse_money_value(raw_value):
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return None
+
+    value = value.replace("r$", "").replace("rs", "").strip()
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[^0-9,\.-]", "", value)
+    if not value:
+        return None
+
+    negative = value.startswith("-")
+    if negative:
+        value = value[1:]
+
+    if "," in value and "." in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
+    elif "," in value:
+        value = value.replace(".", "").replace(",", ".")
+    elif value.count(".") > 1:
+        value = value.replace(".", "")
+
+    try:
+        parsed = float(value)
+        return -parsed if negative else parsed
+    except ValueError:
+        return None
+
+
+def _extract_receipt_subitems(texto_bruto):
+    texto = (texto_bruto or "").strip()
+    if not texto:
+        return []
+
+    texto_lower = texto.lower()
+    if not any(marker in texto_lower for marker in RECEIPT_MARKERS):
+        return []
+
+    date_match = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", texto)
+    data_base = None
+    if date_match:
+        raw = date_match.group(1).replace("-", "/")
+        parts = raw.split("/")
+        if len(parts) == 3:
+            day, month, year = parts
+            year = f"20{year}" if len(year) == 2 else year
+            data_base = f"{year.zfill(4)}-{month.zfill(2)}-{day.zfill(2)}"
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in texto.splitlines() if line.strip()]
+    header_pattern = re.compile(
+        r"^(\d{6,14})\s+(.+?)(?:\s+(?:r\$\s*)?([\d\.,]{3,}))?$",
+        flags=re.IGNORECASE,
+    )
+    money_pattern = re.compile(r"(?:r\$\s*)?-?\d[\d\.,]*[\.,]\d{2}", flags=re.IGNORECASE)
+
+    blocked_tokens = ["total", "desconto", "valor pagar", "valor pago", "cartao", "nfc-e", "serie"]
+
+    items = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        header = header_pattern.match(line)
+        if not header:
+            idx += 1
+            continue
+
+        descricao = (header.group(2) or "").strip(" -:")
+        desc_lower = descricao.lower()
+        if not descricao or any(token in desc_lower for token in blocked_tokens):
+            idx += 1
+            continue
+
+        valor = _parse_money_value(header.group(3) or "")
+
+        lookahead = idx + 1
+        while lookahead < len(lines) and lookahead <= idx + 4:
+            probe = lines[lookahead]
+            if header_pattern.match(probe):
+                break
+            if "valor liquido" in probe.lower() or " por " in probe.lower():
+                amounts = money_pattern.findall(probe)
+                if amounts:
+                    parsed_probe = _parse_money_value(amounts[-1])
+                    if parsed_probe is not None:
+                        valor = parsed_probe
+            lookahead += 1
+
+        if valor is not None and valor > 0:
+            items.append(
+                {
+                    "data": data_base,
+                    "valor": round(float(valor), 2),
+                    "descricao": descricao,
+                    "tipo": "saida",
+                    "document_type": "Saída",
+                }
+            )
+
+        idx += 1
+
+    if len(items) < 2:
+        return []
+    return items
 
 
 def _parse_json_content(content):
@@ -96,7 +211,9 @@ def extrair_dados_financeiros_llm(texto_bruto):
         "2) Não inclua texto de autenticação/terminal/protocolo na descricao; "
         "3) Se detectar pagamento/compra, use tipo='saida'; se detectar recebimento/credito, use tipo='entrada'; "
         "4) O campo document_type deve refletir o tipo global do documento e se repetir em todos os itens; "
-        "5) Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
+        "5) Para cupons/notas fiscais, retorne os itens/subitens comprados (cada produto em uma linha) e não apenas o total/pagamento; "
+        "6) Ignore linhas de resumo como Total, Valor Pago, Forma de Pagamento e Desconto como transações independentes; "
+        "7) Se não conseguir identificar nada com segurança, retorne [] sem texto adicional.\n\n"
         f"Texto:\n{texto_reduzido}"
     )
 
@@ -147,6 +264,11 @@ def extrair_dados_financeiros_llm(texto_bruto):
             document_type = DEFAULT_DOCUMENT_TYPE
         item_saida["document_type"] = document_type
         normalized.append(item_saida)
+
+    if len(normalized) <= 1:
+        heuristica = _extract_receipt_subitems(texto_bruto)
+        if len(heuristica) >= 2:
+            return heuristica, None
 
     return normalized, None
 
