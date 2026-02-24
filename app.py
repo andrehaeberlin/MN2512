@@ -2,6 +2,7 @@ import base64
 import datetime
 import io
 import json
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +13,8 @@ from localDB import (
     STATUS_STORED,
     finalize_pending_documents,
     get_all_transactions,
+    get_document_items,
+    get_document_summaries,
     get_latest_extraction_payload,
     init_db,
     init_ingest_db,
@@ -26,6 +29,81 @@ init_db()
 init_ingest_db()
 
 st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide")
+
+
+SUMMARY_TOKENS = ["total", "valor pago", "valor a pagar", "forma pagamento", "pagamento", "desconto"]
+REVIEW_RENDER_CALLS = 0
+
+
+def _is_summary_line(descricao: str) -> bool:
+    desc = (descricao or "").strip().lower()
+    return bool(desc) and any(token in desc for token in SUMMARY_TOKENS)
+
+
+def _normalize_payload_for_editor(payload: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for item in payload:
+        descricao = str(item.get("descricao") or "").strip()
+        rows.append(
+            {
+                "data": str(item.get("data") or "").strip(),
+                "descricao": descricao,
+                "valor": float(item.get("valor") or 0.0),
+                "tipo": str(item.get("tipo") or "saida").strip().lower() or "saida",
+                "categoria": str(item.get("categoria") or "Outros").strip() or "Outros",
+                "is_resumo": _is_summary_line(descricao),
+            }
+        )
+    return pd.DataFrame(rows, columns=["data", "descricao", "valor", "tipo", "categoria", "is_resumo"])
+
+
+def _payload_from_editor(df_editor: pd.DataFrame) -> List[Dict[str, Any]]:
+    payload = []
+    if df_editor.empty:
+        return payload
+
+    tmp = df_editor.copy()
+    tmp["descricao"] = tmp["descricao"].fillna("").astype(str).str.strip()
+    tmp["tipo"] = tmp["tipo"].fillna("saida").astype(str).str.strip().str.lower()
+    tmp.loc[~tmp["tipo"].isin(["entrada", "saida"]), "tipo"] = "saida"
+    tmp["categoria"] = tmp["categoria"].fillna("Outros").astype(str).str.strip()
+    tmp["data"] = tmp["data"].fillna("").astype(str).str.strip()
+    tmp["valor"] = pd.to_numeric(tmp["valor"], errors="coerce").fillna(0.0)
+
+    for _, row in tmp.iterrows():
+        if not row["descricao"]:
+            continue
+        payload.append(
+            {
+                "data": row["data"],
+                "descricao": row["descricao"],
+                "valor": float(row["valor"]),
+                "tipo": row["tipo"],
+                "categoria": row["categoria"],
+            }
+        )
+    return payload
+
+
+def _looks_generic_product(descricao: str) -> bool:
+    desc = (descricao or "").strip().lower()
+    if not desc:
+        return False
+    return bool(pd.Series([desc]).str.match(r"^produto\s*\d+$", case=False).iloc[0])
+
+
+def _apply_receipt_cleanup(df_editor: pd.DataFrame) -> pd.DataFrame:
+    """Remove linhas genéricas de produto quando houver itens detalhados no mesmo payload."""
+    if df_editor.empty:
+        return df_editor
+
+    df = df_editor.copy()
+    generic_mask = df["descricao"].astype(str).apply(_looks_generic_product)
+    detailed_mask = (~generic_mask) & (~df["is_resumo"].astype(bool)) & df["descricao"].astype(str).str.len().ge(10)
+
+    if detailed_mask.any() and generic_mask.any():
+        df = df[~generic_mask].reset_index(drop=True)
+    return df
 
 
 def render_preview(arq):
@@ -100,6 +178,12 @@ def render_pipeline():
 
 
 def render_review():
+    global REVIEW_RENDER_CALLS
+    REVIEW_RENDER_CALLS += 1
+    if REVIEW_RENDER_CALLS > 1:
+        st.warning("Tela de revisão já renderizada nesta execução. Ignorando render duplicado.")
+        return
+
     st.title("HITL_REVIEW")
     docs = list_ingest_documents([STATUS_HITL_REVIEW])
     if not docs:
@@ -107,7 +191,12 @@ def render_review():
         return
 
     labels = {d["id"]: f"{d['original_name']} ({d['id'][:8]})" for d in docs}
-    selected = st.selectbox("Documento", options=list(labels.keys()), format_func=lambda x: labels[x])
+    selected = st.selectbox(
+        "Documento",
+        options=list(labels.keys()),
+        format_func=lambda x: labels[x],
+        key="review_selected_document",
+    )
 
     payload_info = get_latest_extraction_payload(selected)
     if not payload_info:
@@ -116,18 +205,102 @@ def render_review():
 
     payload_uri, payload, checks = payload_info
     st.caption(f"Payload: {payload_uri}")
-    st.json(checks)
+
+    with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
+        st.json(checks)
+
+    st.subheader("Edição assistida")
+    st.caption("Camada 1: totais/resumo da nota • Camada 2: itens detalhados")
+    df_edit_base = _normalize_payload_for_editor(payload)
+    doc_key = f"review_{selected}"
+
+    if df_edit_base.empty:
+        st.warning("Payload vazio para edição.")
+    else:
+        total_itens = float(df_edit_base.loc[~df_edit_base["is_resumo"], "valor"].sum())
+        declared_candidates = df_edit_base.loc[df_edit_base["is_resumo"], "valor"].tolist()
+        total_declarado = float(declared_candidates[-1]) if declared_candidates else None
+        status_conf = "⚠️ sem total declarado"
+        if total_declarado is not None:
+            status_conf = "✅ confere" if abs(total_declarado - total_itens) <= 0.01 else "❌ divergente"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Itens (qtd)", int((~df_edit_base["is_resumo"]).sum()))
+        c2.metric("Total dos itens", f"R$ {total_itens:.2f}")
+        c3.metric("Total declarado", f"R$ {total_declarado:.2f}" if total_declarado is not None else "N/A")
+        c4.metric("Status", status_conf)
+
+    st.markdown("**Camada 1 · Resumo / Totais**")
+    total_declarado_manual = st.number_input(
+        "Total declarado da nota (editável)",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        value=float(total_declarado) if "total_declarado" in locals() and total_declarado is not None else 0.0,
+        key=f"{doc_key}_total_declarado",
+        help="Use este campo para informar/ajustar o valor pago na nota (ex.: 374,96).",
+    )
+
+    categorias_validas = ["Alimentação", "Transporte", "Serviços", "Outros"]
+    st.markdown("**Camada 2 · Itens detalhados**")
+    df_edit = st.data_editor(
+        df_edit_base,
+        num_rows="dynamic",
+        width="stretch",
+        key=f"{doc_key}_data_editor",
+        column_config={
+            "data": st.column_config.TextColumn("Data (YYYY-MM-DD)", help="Mantenha no formato YYYY-MM-DD"),
+            "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+            "valor": st.column_config.NumberColumn("Valor", format="%.2f", required=True),
+            "tipo": st.column_config.SelectboxColumn("Tipo", options=["entrada", "saida"], required=True),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=categorias_validas, required=True),
+            "is_resumo": st.column_config.CheckboxColumn("Linha de resumo?", help="Marque para Total/Pagamento/Desconto"),
+        },
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Remover linhas marcadas como resumo", key=f"{doc_key}_btn_remove_summary"):
+            if not df_edit.empty:
+                df_edit = df_edit[~df_edit["is_resumo"]].reset_index(drop=True)
+                st.success("Linhas de resumo removidas da revisão.")
+    with right:
+        st.caption("Dica: mantenha linhas de resumo apenas para conferência; elas não viram itens finais.")
+
+    if st.button("Aplicar limpeza automática (remover 'Produto X' genérico)", key=f"{doc_key}_btn_cleanup_generic"):
+        df_edit = _apply_receipt_cleanup(df_edit)
+        st.success("Limpeza aplicada. Itens genéricos removidos quando havia descrição detalhada.")
+
+    edited_payload_data = _payload_from_editor(df_edit)
+
+    if total_declarado_manual > 0:
+        edited_payload_data = [
+            item
+            for item in edited_payload_data
+            if not _is_summary_line(str(item.get("descricao") or ""))
+        ]
+        edited_payload_data.append(
+            {
+                "data": edited_payload_data[0]["data"] if edited_payload_data else "",
+                "descricao": "Total declarado",
+                "valor": float(total_declarado_manual),
+                "tipo": "saida",
+                "categoria": "Outros",
+            }
+        )
 
     edited_json = st.text_area(
-        "Edite o payload candidato (JSON)",
-        value=json.dumps(payload, ensure_ascii=False, indent=2),
-        height=320,
+        "Payload final (JSON)",
+        value=json.dumps(edited_payload_data, ensure_ascii=False, indent=2),
+        height=280,
+        key=f"{doc_key}_payload_json",
+        help="Você ainda pode ajustar manualmente o JSON antes de salvar.",
     )
-    reviewer = st.text_input("Reviewer", value="operador")
-    decision = st.selectbox("Decisão", ["APPROVED", "CHANGES", "REJECTED"])
-    notes = st.text_area("Notas")
+    reviewer = st.text_input("Reviewer", value="operador", key=f"{doc_key}_reviewer")
+    decision = st.selectbox("Decisão", ["APPROVED", "CHANGES", "REJECTED"], key=f"{doc_key}_decision")
+    notes = st.text_area("Notas", key=f"{doc_key}_notes")
 
-    if st.button("Salvar revisão"):
+    if st.button("Salvar revisão", key=f"{doc_key}_btn_save"):
         try:
             edited_payload = json.loads(edited_json)
             if not isinstance(edited_payload, list):
@@ -158,6 +331,50 @@ def render_finalize():
 
 def render_history_section():
     st.title("📜 Histórico de Transações")
+    st.subheader("Notas/Documentos (resumo)")
+
+    df_resumos = get_document_summaries()
+    selected_doc_id = None
+    if df_resumos.empty:
+        st.info("Nenhum resumo de documento encontrado.")
+    else:
+        df_resumos_view = df_resumos.copy()
+        df_resumos_view["data_documento"] = pd.to_datetime(df_resumos_view["data_documento"], errors="coerce")
+        df_resumos_view["status_total"] = df_resumos_view["total_confere"].map({1: "✅ confere", 0: "❌ divergente"}).fillna("⚠️ sem total declarado")
+        st.dataframe(
+            df_resumos_view[
+                [
+                    "document_id",
+                    "fonte",
+                    "data_documento",
+                    "qtd_itens",
+                    "total_itens",
+                    "total_declarado",
+                    "status_total",
+                    "criado_em",
+                ]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+        options = ["Todos"] + df_resumos["document_id"].astype(str).tolist()
+        selected_doc_id = st.selectbox("Filtrar itens por documento", options=options, index=0)
+
+    st.subheader("Itens dos documentos")
+    filtro_doc = None if selected_doc_id in [None, "Todos"] else selected_doc_id
+    df_itens = get_document_items(filtro_doc)
+    if df_itens.empty:
+        st.info("Nenhum item de documento encontrado.")
+    else:
+        df_itens["data"] = pd.to_datetime(df_itens["data"], errors="coerce")
+        st.dataframe(
+            df_itens.sort_values(["document_id", "data", "id"], ascending=[False, False, False]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("Transações (legado/completo)")
     df_historico = get_all_transactions()
     if df_historico.empty:
         st.info("Nenhum registro encontrado.")
