@@ -70,6 +70,44 @@ def init_db():
 
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS documento_resumos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL UNIQUE,
+                fonte TEXT NOT NULL,
+                data_documento TEXT,
+                total_declarado REAL,
+                total_itens REAL NOT NULL,
+                total_confere INTEGER,
+                qtd_itens INTEGER NOT NULL DEFAULT 0,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_resumo_documento ON documento_resumos(document_id);")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documento_itens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resumo_id INTEGER NOT NULL,
+                transacao_id INTEGER,
+                data TEXT,
+                descricao TEXT NOT NULL,
+                valor REAL NOT NULL,
+                tipo TEXT NOT NULL DEFAULT 'saida',
+                categoria TEXT,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(resumo_id) REFERENCES documento_resumos(id),
+                FOREIGN KEY(transacao_id) REFERENCES transacoes(id)
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_item_resumo ON documento_itens(resumo_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_item_transacao ON documento_itens(transacao_id);")
+
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT NOT NULL,
@@ -238,6 +276,59 @@ def get_all_transactions():
     try:
         with sqlite3.connect(DB_NAME) as conn:
             return pd.read_sql_query("SELECT * FROM transacoes ORDER BY data DESC", conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_document_summaries() -> pd.DataFrame:
+    try:
+        with sqlite3.connect(DB_NAME) as conn:
+            return pd.read_sql_query(
+                """
+                SELECT
+                    dr.id,
+                    dr.document_id,
+                    dr.fonte,
+                    dr.data_documento,
+                    dr.total_declarado,
+                    dr.total_itens,
+                    dr.total_confere,
+                    dr.qtd_itens,
+                    dr.criado_em,
+                    dr.atualizado_em
+                FROM documento_resumos dr
+                ORDER BY dr.criado_em DESC
+                """,
+                conn,
+            )
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_document_items(document_id: Optional[str] = None) -> pd.DataFrame:
+    try:
+        query = """
+            SELECT
+                di.id,
+                dr.document_id,
+                di.transacao_id,
+                di.data,
+                di.descricao,
+                di.valor,
+                di.tipo,
+                di.categoria,
+                di.criado_em
+            FROM documento_itens di
+            INNER JOIN documento_resumos dr ON dr.id = di.resumo_id
+        """
+        params: Tuple[Any, ...] = ()
+        if document_id:
+            query += " WHERE dr.document_id = ?"
+            params = (str(document_id),)
+        query += " ORDER BY di.criado_em DESC, di.id DESC"
+
+        with sqlite3.connect(DB_NAME) as conn:
+            return pd.read_sql_query(query, conn, params=params)
     except Exception:
         return pd.DataFrame()
 
@@ -828,7 +919,23 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
     with open(review_uri, "r", encoding="utf-8") as handler:
         payload = json.load(handler)
 
+    resumo_tokens = [
+        "total",
+        "valor pago",
+        "valor a pagar",
+        "forma pagamento",
+        "pagamento",
+        "desconto",
+    ]
+
+    def _is_summary_line(descricao: str) -> bool:
+        desc = (descricao or "").strip().lower()
+        if not desc:
+            return False
+        return any(token in desc for token in resumo_tokens)
+
     rows = []
+    summary_candidates = []
     for item in payload:
         desc = str(item.get("descricao") or "").strip()
         if not desc:
@@ -838,6 +945,12 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
         tipo = str(item.get("tipo") or "saida").strip().lower()
         if tipo not in ["entrada", "saida"]:
             tipo = "saida"
+
+        if _is_summary_line(desc):
+            if valor > 0:
+                summary_candidates.append(valor)
+            continue
+
         rows.append(
             {
                 "data": data,
@@ -857,10 +970,68 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
     insert_transactions(df)
 
     with sqlite3.connect(DB_NAME) as conn:
+        total_itens = round(float(df["valor"].sum()), 2)
+        total_declarado = round(float(summary_candidates[-1]), 2) if summary_candidates else None
+        total_confere = None
+        if total_declarado is not None:
+            total_confere = int(abs(total_declarado - total_itens) <= 0.01)
+
+        data_documento = None
+        for dt in df["data"].tolist():
+            if dt:
+                data_documento = dt
+                break
+
+        conn.execute(
+            """
+            INSERT INTO documento_resumos
+                (document_id, fonte, data_documento, total_declarado, total_itens, total_confere, qtd_itens, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(document_id) DO UPDATE SET
+                fonte=excluded.fonte,
+                data_documento=excluded.data_documento,
+                total_declarado=excluded.total_declarado,
+                total_itens=excluded.total_itens,
+                total_confere=excluded.total_confere,
+                qtd_itens=excluded.qtd_itens,
+                atualizado_em=CURRENT_TIMESTAMP
+            """,
+            (
+                document_id,
+                doc[1],
+                data_documento,
+                total_declarado,
+                total_itens,
+                total_confere,
+                int(len(df)),
+            ),
+        )
+        resumo_id_row = conn.execute(
+            "SELECT id FROM documento_resumos WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        resumo_id = int(resumo_id_row[0])
+        conn.execute("DELETE FROM documento_itens WHERE resumo_id = ?", (resumo_id,))
+
         for _, row in df.iterrows():
             tx_id = find_transaction_id(row["data"], row["descricao"], float(row["valor"]), row["fonte"], row["tipo"])
             if tx_id:
                 conn.execute("UPDATE transacoes SET document_id = ? WHERE id = ?", (document_id, tx_id))
+                conn.execute(
+                    """
+                    INSERT INTO documento_itens (resumo_id, transacao_id, data, descricao, valor, tipo, categoria)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        resumo_id,
+                        tx_id,
+                        row["data"],
+                        row["descricao"],
+                        float(row["valor"]),
+                        row["tipo"],
+                        row["categoria"],
+                    ),
+                )
 
     _update_ingest_status(document_id, STATUS_FINALIZED)
     return True, "Finalização concluída."
