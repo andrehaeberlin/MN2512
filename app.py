@@ -272,6 +272,130 @@ def render_review():
             }
         )
 
+    with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
+        st.json(checks)
+
+    st.subheader("Edição assistida")
+    df_edit_base = _normalize_payload_for_editor(payload)
+
+    if df_edit_base.empty:
+        st.warning("Payload vazio para edição.")
+    else:
+        total_itens = float(df_edit_base.loc[~df_edit_base["is_resumo"], "valor"].sum())
+        declared_candidates = df_edit_base.loc[df_edit_base["is_resumo"], "valor"].tolist()
+        total_declarado = float(declared_candidates[-1]) if declared_candidates else None
+        status_conf = "⚠️ sem total declarado"
+        if total_declarado is not None:
+            status_conf = "✅ confere" if abs(total_declarado - total_itens) <= 0.01 else "❌ divergente"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Itens (qtd)", int((~df_edit_base["is_resumo"]).sum()))
+        c2.metric("Total dos itens", f"R$ {total_itens:.2f}")
+        c3.metric("Total declarado", f"R$ {total_declarado:.2f}" if total_declarado is not None else "N/A")
+        c4.metric("Status", status_conf)
+
+    total_declarado_manual = st.number_input(
+        "Total declarado da nota (editável)",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        value=float(total_declarado) if "total_declarado" in locals() and total_declarado is not None else 0.0,
+        help="Use este campo para informar/ajustar o valor pago na nota (ex.: 374,96).",
+    )
+
+    categorias_validas = ["Alimentação", "Transporte", "Serviços", "Outros"]
+    df_edit = st.data_editor(
+        df_edit_base,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "data": st.column_config.TextColumn("Data (YYYY-MM-DD)", help="Mantenha no formato YYYY-MM-DD"),
+            "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+            "valor": st.column_config.NumberColumn("Valor", format="%.2f", required=True),
+            "tipo": st.column_config.SelectboxColumn("Tipo", options=["entrada", "saida"], required=True),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=categorias_validas, required=True),
+            "is_resumo": st.column_config.CheckboxColumn("Linha de resumo?", help="Marque para Total/Pagamento/Desconto"),
+        },
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Remover linhas marcadas como resumo"):
+            if not df_edit.empty:
+                df_edit = df_edit[~df_edit["is_resumo"]].reset_index(drop=True)
+                st.success("Linhas de resumo removidas da revisão.")
+    with right:
+        st.caption("Dica: mantenha linhas de resumo apenas para conferência; elas não viram itens finais.")
+
+    if st.button("Aplicar limpeza automática (remover 'Produto X' genérico)"):
+        df_edit = _apply_receipt_cleanup(df_edit)
+        st.success("Limpeza aplicada. Itens genéricos removidos quando havia descrição detalhada.")
+
+    edited_payload_data = _payload_from_editor(df_edit)
+
+    if total_declarado_manual > 0:
+        edited_payload_data = [
+            item
+            for item in edited_payload_data
+            if not _is_summary_line(str(item.get("descricao") or ""))
+        ]
+        edited_payload_data.append(
+            {
+                "data": edited_payload_data[0]["data"] if edited_payload_data else "",
+                "descricao": "Total declarado",
+                "valor": float(total_declarado_manual),
+                "tipo": "saida",
+                "categoria": "Outros",
+            }
+        )
+
+    with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
+        st.json(checks)
+
+    st.subheader("Edição assistida")
+    df_edit_base = _normalize_payload_for_editor(payload)
+
+    if df_edit_base.empty:
+        st.warning("Payload vazio para edição.")
+    else:
+        total_itens = float(df_edit_base.loc[~df_edit_base["is_resumo"], "valor"].sum())
+        declared_candidates = df_edit_base.loc[df_edit_base["is_resumo"], "valor"].tolist()
+        total_declarado = float(declared_candidates[-1]) if declared_candidates else None
+        status_conf = "⚠️ sem total declarado"
+        if total_declarado is not None:
+            status_conf = "✅ confere" if abs(total_declarado - total_itens) <= 0.01 else "❌ divergente"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Itens (qtd)", int((~df_edit_base["is_resumo"]).sum()))
+        c2.metric("Total dos itens", f"R$ {total_itens:.2f}")
+        c3.metric("Total declarado", f"R$ {total_declarado:.2f}" if total_declarado is not None else "N/A")
+        c4.metric("Status", status_conf)
+
+    categorias_validas = ["Alimentação", "Transporte", "Serviços", "Outros"]
+    df_edit = st.data_editor(
+        df_edit_base,
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "data": st.column_config.TextColumn("Data (YYYY-MM-DD)", help="Mantenha no formato YYYY-MM-DD"),
+            "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+            "valor": st.column_config.NumberColumn("Valor", format="%.2f", required=True),
+            "tipo": st.column_config.SelectboxColumn("Tipo", options=["entrada", "saida"], required=True),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=categorias_validas, required=True),
+            "is_resumo": st.column_config.CheckboxColumn("Linha de resumo?", help="Marque para Total/Pagamento/Desconto"),
+        },
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Remover linhas marcadas como resumo"):
+            if not df_edit.empty:
+                df_edit = df_edit[~df_edit["is_resumo"]].reset_index(drop=True)
+                st.success("Linhas de resumo removidas da revisão.")
+    with right:
+        st.caption("Dica: mantenha linhas de resumo apenas para conferência; elas não viram itens finais.")
+
+    edited_payload_data = _payload_from_editor(df_edit)
     edited_json = st.text_area(
         "Payload final (JSON)",
         value=json.dumps(edited_payload_data, ensure_ascii=False, indent=2),
