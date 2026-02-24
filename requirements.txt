@@ -8,3 +8,4 @@ pdfplumber
 PyMuPDF
 openpyxl
 pytest
+python-dotenv
