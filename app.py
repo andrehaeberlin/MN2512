@@ -32,6 +32,7 @@ st.set_page_config(page_title="Extrator Pro MVP", page_icon="💰", layout="wide
 
 
 SUMMARY_TOKENS = ["total", "valor pago", "valor a pagar", "forma pagamento", "pagamento", "desconto"]
+REVIEW_RENDER_CALLS = 0
 
 
 def _is_summary_line(descricao: str) -> bool:
@@ -177,6 +178,12 @@ def render_pipeline():
 
 
 def render_review():
+    global REVIEW_RENDER_CALLS
+    REVIEW_RENDER_CALLS += 1
+    if REVIEW_RENDER_CALLS > 1:
+        st.warning("Tela de revisão já renderizada nesta execução. Ignorando render duplicado.")
+        return
+
     st.title("HITL_REVIEW")
     docs = list_ingest_documents([STATUS_HITL_REVIEW])
     if not docs:
@@ -184,7 +191,12 @@ def render_review():
         return
 
     labels = {d["id"]: f"{d['original_name']} ({d['id'][:8]})" for d in docs}
-    selected = st.selectbox("Documento", options=list(labels.keys()), format_func=lambda x: labels[x])
+    selected = st.selectbox(
+        "Documento",
+        options=list(labels.keys()),
+        format_func=lambda x: labels[x],
+        key="review_selected_document",
+    )
 
     payload_info = get_latest_extraction_payload(selected)
     if not payload_info:
@@ -193,6 +205,89 @@ def render_review():
 
     payload_uri, payload, checks = payload_info
     st.caption(f"Payload: {payload_uri}")
+
+    with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
+        st.json(checks)
+
+    st.subheader("Edição assistida")
+    st.caption("Camada 1: totais/resumo da nota • Camada 2: itens detalhados")
+    df_edit_base = _normalize_payload_for_editor(payload)
+    doc_key = f"review_{selected}"
+
+    if df_edit_base.empty:
+        st.warning("Payload vazio para edição.")
+    else:
+        total_itens = float(df_edit_base.loc[~df_edit_base["is_resumo"], "valor"].sum())
+        declared_candidates = df_edit_base.loc[df_edit_base["is_resumo"], "valor"].tolist()
+        total_declarado = float(declared_candidates[-1]) if declared_candidates else None
+        status_conf = "⚠️ sem total declarado"
+        if total_declarado is not None:
+            status_conf = "✅ confere" if abs(total_declarado - total_itens) <= 0.01 else "❌ divergente"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Itens (qtd)", int((~df_edit_base["is_resumo"]).sum()))
+        c2.metric("Total dos itens", f"R$ {total_itens:.2f}")
+        c3.metric("Total declarado", f"R$ {total_declarado:.2f}" if total_declarado is not None else "N/A")
+        c4.metric("Status", status_conf)
+
+    st.markdown("**Camada 1 · Resumo / Totais**")
+    total_declarado_manual = st.number_input(
+        "Total declarado da nota (editável)",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        value=float(total_declarado) if "total_declarado" in locals() and total_declarado is not None else 0.0,
+        key=f"{doc_key}_total_declarado",
+        help="Use este campo para informar/ajustar o valor pago na nota (ex.: 374,96).",
+    )
+
+    categorias_validas = ["Alimentação", "Transporte", "Serviços", "Outros"]
+    st.markdown("**Camada 2 · Itens detalhados**")
+    df_edit = st.data_editor(
+        df_edit_base,
+        num_rows="dynamic",
+        width="stretch",
+        key=f"{doc_key}_data_editor",
+        column_config={
+            "data": st.column_config.TextColumn("Data (YYYY-MM-DD)", help="Mantenha no formato YYYY-MM-DD"),
+            "descricao": st.column_config.TextColumn("Descrição", width="large", required=True),
+            "valor": st.column_config.NumberColumn("Valor", format="%.2f", required=True),
+            "tipo": st.column_config.SelectboxColumn("Tipo", options=["entrada", "saida"], required=True),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=categorias_validas, required=True),
+            "is_resumo": st.column_config.CheckboxColumn("Linha de resumo?", help="Marque para Total/Pagamento/Desconto"),
+        },
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("Remover linhas marcadas como resumo", key=f"{doc_key}_btn_remove_summary"):
+            if not df_edit.empty:
+                df_edit = df_edit[~df_edit["is_resumo"]].reset_index(drop=True)
+                st.success("Linhas de resumo removidas da revisão.")
+    with right:
+        st.caption("Dica: mantenha linhas de resumo apenas para conferência; elas não viram itens finais.")
+
+    if st.button("Aplicar limpeza automática (remover 'Produto X' genérico)", key=f"{doc_key}_btn_cleanup_generic"):
+        df_edit = _apply_receipt_cleanup(df_edit)
+        st.success("Limpeza aplicada. Itens genéricos removidos quando havia descrição detalhada.")
+
+    edited_payload_data = _payload_from_editor(df_edit)
+
+    if total_declarado_manual > 0:
+        edited_payload_data = [
+            item
+            for item in edited_payload_data
+            if not _is_summary_line(str(item.get("descricao") or ""))
+        ]
+        edited_payload_data.append(
+            {
+                "data": edited_payload_data[0]["data"] if edited_payload_data else "",
+                "descricao": "Total declarado",
+                "valor": float(total_declarado_manual),
+                "tipo": "saida",
+                "categoria": "Outros",
+            }
+        )
 
     with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
         st.json(checks)
@@ -483,14 +578,14 @@ def render_review():
         "Payload final (JSON)",
         value=json.dumps(edited_payload_data, ensure_ascii=False, indent=2),
         height=280,
-        key=f"review_payload_json_{doc_key}",
+        key=f"{doc_key}_payload_json",
         help="Você ainda pode ajustar manualmente o JSON antes de salvar.",
     )
-    reviewer = st.text_input("Reviewer", value="operador", key=f"review_reviewer_{doc_key}")
-    decision = st.selectbox("Decisão", ["APPROVED", "CHANGES", "REJECTED"], key=f"review_decision_{doc_key}")
-    notes = st.text_area("Notas", key=f"review_notes_{doc_key}")
+    reviewer = st.text_input("Reviewer", value="operador", key=f"{doc_key}_reviewer")
+    decision = st.selectbox("Decisão", ["APPROVED", "CHANGES", "REJECTED"], key=f"{doc_key}_decision")
+    notes = st.text_area("Notas", key=f"{doc_key}_notes")
 
-    if st.button("Salvar revisão", key=f"btn_save_review_{doc_key}"):
+    if st.button("Salvar revisão", key=f"{doc_key}_btn_save"):
         try:
             edited_payload = json.loads(edited_json)
             if not isinstance(edited_payload, list):
