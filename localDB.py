@@ -518,6 +518,29 @@ def init_ingest_db():
             """
         )
 
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        if "raw_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN raw_hash TEXT")
+        if "text_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN text_hash TEXT")
+        if "payload_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN payload_hash TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_payload_hash ON documents(payload_hash);")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_cache (
+                hash TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS artifacts (
@@ -835,6 +858,86 @@ def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
         )
 
 
+def update_document_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
+    """Atualiza status de um documento na fila de ingestão."""
+    init_ingest_db()
+    _update_ingest_status(str(document_id), status, error_message)
+
+
+def update_document_hashes(document_id: str, text_hash: Optional[str] = None, payload_hash: Optional[str] = None) -> None:
+    init_ingest_db()
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        if text_hash is not None:
+            conn.execute(
+                "UPDATE documents SET text_hash = ?, updated_at = ? WHERE id = ?",
+                (text_hash, _now_iso(), document_id),
+            )
+        if payload_hash is not None:
+            conn.execute(
+                "UPDATE documents SET payload_hash = ?, updated_at = ? WHERE id = ?",
+                (payload_hash, _now_iso(), document_id),
+            )
+
+
+def find_document_by_text_hash(text_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE text_hash = ?"
+    params: List[Any] = [text_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status, payload_hash
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1], "payload_hash": row[2]}
+
+
+def find_document_by_payload_hash(payload_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE payload_hash = ?"
+    params: List[Any] = [payload_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1]}
+
+
+def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
+    init_ingest_db()
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO content_cache (hash, type, uri) VALUES (?, ?, ?)",
+            (content_hash, content_type, uri),
+        )
+
+
 def _save_artifact(document_id: str, doc_sha: str, kind: str, relative_path: str, content: bytes, meta: Optional[Dict[str, Any]] = None) -> str:
     storage_uri = os.path.join("data", "artifacts", doc_sha, relative_path)
     _write_bytes(storage_uri, content)
@@ -920,6 +1023,10 @@ def _requires_llm(metrics: ExtractionMetrics) -> Optional[str]:
         return "low_dates_ratio"
     return None
 
+    with open(payload_uri, "r", encoding="utf-8") as handler:
+        payload = json.load(handler)
+    if not isinstance(payload, list):
+        return None
 
 def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default") -> None:
     init_ingest_db()
@@ -1135,6 +1242,10 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                 self.name = name
                 self.type = mime_type
 
+        payload = []
+        checks = {}
+        payload_reused = False
+
         if ext in [".csv", ".xlsx"]:
             upload = _UploadWrap(raw_bytes, original_name, mime)
             df_plan, err = processar_planilha(upload)
@@ -1200,7 +1311,8 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
 
         payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
         checks_uri = os.path.join("data", "artifacts", sha, "extraction", "llm_checks.json")
-        checks = _run_llm_checks(payload)
+        if not checks:
+            checks = _run_llm_checks(payload)
         _write_json(payload_uri, payload)
         _write_json(checks_uri, checks)
         save_content_cache(payload_hash, "payload", payload_uri)
