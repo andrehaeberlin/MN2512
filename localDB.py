@@ -3,9 +3,11 @@ import io
 import json
 from dataclasses import asdict, dataclass
 import logging
+import random
 import os
 import sqlite3
 import uuid
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -62,13 +64,60 @@ class ExtractionResult:
 
 
 
+
+
+def get_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+
+
+def with_tx(conn: sqlite3.Connection, fn):
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        result = fn(conn)
+        conn.execute("COMMIT;")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+
+
+def retry_on_lock(fn, attempts: int = 6, base_delay: float = 0.2):
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            sleep_for = base_delay * (2 ** i) + random.random() * 0.1
+            time.sleep(sleep_for)
+    if last_exc:
+        raise last_exc
+
 def init_db():
     """Inicializa/migra o banco principal da aplicação."""
     folder = os.path.dirname(DB_NAME)
     if folder and not os.path.exists(folder):
         os.makedirs(folder)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
+        apply_sqlite_pragmas(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transacoes (
@@ -95,6 +144,7 @@ def init_db():
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tipo_data ON transacoes(tipo, data);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_categoria_data ON transacoes(categoria, data);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_document_id ON transacoes(document_id);")
 
         conn.execute(
             """
@@ -228,7 +278,7 @@ def insert_document(file_name: str, mime: str, file_bytes: bytes, storage_dir: s
         with open(storage_path, "wb") as handler:
             handler.write(file_bytes)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO documents (nome, mime, sha256, storage_path) VALUES (?, ?, ?, ?)",
             (file_name, mime or "application/octet-stream", sha, storage_path),
@@ -240,7 +290,7 @@ def insert_document(file_name: str, mime: str, file_bytes: bytes, storage_dir: s
 
 def get_document_bytes(document_id: int) -> Tuple[bytes, str, str]:
     """Retorna (bytes, mime, nome) para visualização/download."""
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         row = conn.execute(
             "SELECT storage_path, mime, nome FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
@@ -254,7 +304,7 @@ def get_document_bytes(document_id: int) -> Tuple[bytes, str, str]:
 
 
 def link_entities(from_type: str, from_id: int, to_type: str, to_id: int) -> None:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO links (from_type, from_id, to_type, to_id) VALUES (?, ?, ?, ?)",
             (from_type, int(from_id), to_type, int(to_id)),
@@ -262,7 +312,7 @@ def link_entities(from_type: str, from_id: int, to_type: str, to_id: int) -> Non
 
 
 def find_transaction_id(data: str, descricao: str, valor: float, fonte: str, tipo: str = "saida") -> Optional[int]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         row = conn.execute(
             "SELECT id FROM transacoes WHERE data = ? AND descricao = ? AND valor = ? AND fonte = ? AND tipo = ?",
             (data, descricao, float(valor), fonte, tipo),
@@ -297,18 +347,25 @@ def insert_transactions(df: pd.DataFrame):
     df_final.loc[~df_final["tipo"].isin(["entrada", "saida"]), "tipo"] = "saida"
 
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            df_final.to_sql("staging_transacoes", conn, if_exists="replace", index=False)
+        def _op():
+            with get_conn(DB_NAME) as conn:
+                apply_sqlite_pragmas(conn)
 
-            query_upsert = """
-            INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria, tipo)
-            SELECT data, descricao, valor, fonte, categoria, tipo FROM staging_transacoes;
-            """
-            cursor = conn.execute(query_upsert)
-            novas_linhas = cursor.rowcount
+                df_final.to_sql("staging_transacoes", conn, if_exists="replace", index=False)
 
-            conn.execute("DROP TABLE staging_transacoes;")
-            return novas_linhas
+                def _write(c):
+                    cursor = c.execute(
+                        """
+                        INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria, tipo)
+                        SELECT data, descricao, valor, fonte, categoria, tipo FROM staging_transacoes;
+                        """
+                    )
+                    c.execute("DROP TABLE IF EXISTS staging_transacoes;")
+                    return int(cursor.rowcount)
+
+                return with_tx(conn, _write)
+
+        return retry_on_lock(_op)
     except Exception as exc:
         raise Exception(f"Erro técnico na camada de dados: {exc}")
 
@@ -316,7 +373,7 @@ def insert_transactions(df: pd.DataFrame):
 def get_all_transactions():
     """Busca o histórico completo."""
     try:
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query("SELECT * FROM transacoes ORDER BY data DESC", conn)
     except Exception:
         return pd.DataFrame()
@@ -324,7 +381,7 @@ def get_all_transactions():
 
 def get_document_summaries() -> pd.DataFrame:
     try:
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query(
                 """
                 SELECT
@@ -369,14 +426,14 @@ def get_document_items(document_id: Optional[str] = None) -> pd.DataFrame:
             params = (str(document_id),)
         query += " ORDER BY di.criado_em DESC, di.id DESC"
 
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query(query, conn, params=params)
     except Exception:
         return pd.DataFrame()
 
 
 def insert_statement(document_id: int, banco: Optional[str], cartao: Optional[str], competencia: str) -> int:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         cur = conn.execute(
             "INSERT INTO statements (document_id, banco, cartao, competencia) VALUES (?, ?, ?, ?)",
             (int(document_id), banco, cartao, competencia),
@@ -403,7 +460,7 @@ def insert_statement_lines(statement_id: int, competencia: str, lines: Iterable[
     if not payload:
         return 0
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         cur = conn.executemany(
             """
             INSERT OR IGNORE INTO statement_lines
@@ -417,7 +474,8 @@ def insert_statement_lines(statement_id: int, competencia: str, lines: Iterable[
 
 def init_ingest_db():
     """Inicializa/migra o banco de ingestão da pipeline."""
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
+        apply_sqlite_pragmas(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS documents (
@@ -435,6 +493,30 @@ def init_ingest_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ingest_documents_status ON documents(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingest_documents_status_created ON documents(status, created_at);")
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        if "raw_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN raw_hash TEXT")
+        if "text_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN text_hash TEXT")
+        if "payload_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN payload_hash TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_payload_hash ON documents(payload_hash);")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_cache (
+                hash TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
 
         columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
         if "raw_hash" not in columns:
@@ -527,6 +609,7 @@ def init_ingest_db():
             );
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_document_created ON reviews(document_id, created_at);")
 
 
 def _safe_name(filename: str) -> str:
@@ -561,7 +644,7 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
     if not os.path.exists(raw_path):
         _write_bytes(raw_path, file_bytes)
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         existing = conn.execute(
             """
             SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
@@ -647,7 +730,7 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
         params = tuple(statuses)
     query += " ORDER BY created_at DESC"
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         rows = conn.execute(query, params).fetchall()
 
     return [
@@ -671,10 +754,107 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
 
 
 def _update_ingest_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                c.execute(
+                    "UPDATE documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                    (status, error_message, _now_iso(), document_id),
+                )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def update_document_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
+    """Atualiza status de um documento na fila de ingestão."""
+    init_ingest_db()
+    _update_ingest_status(str(document_id), status, error_message)
+
+
+def update_document_hashes(document_id: str, text_hash: Optional[str] = None, payload_hash: Optional[str] = None) -> None:
+    init_ingest_db()
+
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                if text_hash is not None:
+                    c.execute(
+                        "UPDATE documents SET text_hash = ?, updated_at = ? WHERE id = ?",
+                        (text_hash, _now_iso(), document_id),
+                    )
+                if payload_hash is not None:
+                    c.execute(
+                        "UPDATE documents SET payload_hash = ?, updated_at = ? WHERE id = ?",
+                        (payload_hash, _now_iso(), document_id),
+                    )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def find_document_by_text_hash(text_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE text_hash = ?"
+    params: List[Any] = [text_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status, payload_hash
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1], "payload_hash": row[2]}
+
+
+def find_document_by_payload_hash(payload_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE payload_hash = ?"
+    params: List[Any] = [payload_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1]}
+
+
+def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
+    init_ingest_db()
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
-            "UPDATE documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
-            (status, error_message, _now_iso(), document_id),
+            "INSERT OR REPLACE INTO content_cache (hash, type, uri) VALUES (?, ?, ?)",
+            (content_hash, content_type, uri),
         )
 
 
@@ -762,7 +942,7 @@ def _save_artifact(document_id: str, doc_sha: str, kind: str, relative_path: str
     storage_uri = os.path.join("data", "artifacts", doc_sha, relative_path)
     _write_bytes(storage_uri, content)
     art_sha = _sha256_bytes(content)
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO artifacts (document_id, kind, storage_uri, sha256, meta_json)
@@ -843,10 +1023,14 @@ def _requires_llm(metrics: ExtractionMetrics) -> Optional[str]:
         return "low_dates_ratio"
     return None
 
+    with open(payload_uri, "r", encoding="utf-8") as handler:
+        payload = json.load(handler)
+    if not isinstance(payload, list):
+        return None
 
 def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default") -> None:
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO llm_cache (text_hash, llm_payload_uri, llm_model, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
             (text_hash, payload_uri, llm_model),
@@ -855,7 +1039,7 @@ def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default"
 
 def _get_llm_cached_payload(text_hash: str) -> Optional[Tuple[List[Dict[str, Any]], str, str]]:
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         row = conn.execute(
             "SELECT llm_payload_uri, COALESCE(llm_model, 'default') FROM llm_cache WHERE text_hash = ?",
             (text_hash,),
@@ -989,19 +1173,27 @@ def _record_extraction(
     llm_model: Optional[str] = None,
 ) -> None:
     metrics_json = json.dumps(asdict(metrics), ensure_ascii=False) if metrics else None
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        conn.execute(
-            """
-            INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, metrics_json, text_hash, llm_model, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, metrics_json, text_hash, llm_model, "PENDING"),
-        )
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                c.execute(
+                    """
+                    INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, metrics_json, text_hash, llm_model, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, metrics_json, text_hash, llm_model, "PENDING"),
+                )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
 
 
 def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         doc = conn.execute(
             "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, raw_hash, text_hash, payload_hash FROM documents WHERE id = ?",
             (document_id,),
@@ -1029,7 +1221,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
 
     current_raw_hash = compute_raw_hash(raw_bytes)
     if raw_hash != current_raw_hash:
-        with sqlite3.connect(INGEST_DB_NAME) as conn:
+        with get_conn(INGEST_DB_NAME) as conn:
             conn.execute(
                 "UPDATE documents SET raw_hash = ?, updated_at = ? WHERE id = ?",
                 (current_raw_hash, _now_iso(), document_id),
@@ -1172,7 +1364,7 @@ def process_stored_documents(limit: int = 20) -> Dict[str, int]:
 
 
 def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any], str, float, Dict[str, Any]]]:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         row = conn.execute(
             """
             SELECT payload_uri, llm_checks_uri, extractor, confidence, metrics_json
@@ -1206,7 +1398,7 @@ def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[
 
 
 def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_payload: List[Dict[str, Any]], notes: str = "") -> str:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         row = conn.execute("SELECT sha256 FROM documents WHERE id = ?", (document_id,)).fetchone()
     if not row:
         raise ValueError("Documento não encontrado.")
@@ -1214,7 +1406,7 @@ def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_pa
     review_uri = os.path.join("data", "artifacts", sha, "review", "approved.json")
     _write_json(review_uri, edited_payload)
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
             "INSERT INTO reviews (document_id, reviewer, decision, edited_payload_uri, notes) VALUES (?, ?, ?, ?, ?)",
             (document_id, reviewer, decision, review_uri, notes),
@@ -1231,7 +1423,7 @@ def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_pa
 def finalize_document(document_id: str) -> Tuple[bool, str]:
     init_db()
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         doc = conn.execute(
             "SELECT id, original_name, status, payload_hash FROM documents WHERE id = ?",
             (document_id,),
@@ -1314,7 +1506,7 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
     df = pd.DataFrame(rows)
     insert_transactions(df)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         total_itens = round(float(df["valor"].sum()), 2)
         total_declarado = round(float(summary_candidates[-1]), 2) if summary_candidates else None
         total_confere = None
