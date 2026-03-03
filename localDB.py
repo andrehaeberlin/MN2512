@@ -557,6 +557,12 @@ def _update_ingest_status(document_id: str, status: str, error_message: Optional
         )
 
 
+def update_document_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
+    """Atualiza status de um documento na fila de ingestão."""
+    init_ingest_db()
+    _update_ingest_status(str(document_id), status, error_message)
+
+
 def _save_artifact(document_id: str, doc_sha: str, kind: str, relative_path: str, content: bytes, meta: Optional[Dict[str, Any]] = None) -> str:
     storage_uri = os.path.join("data", "artifacts", doc_sha, relative_path)
     _write_bytes(storage_uri, content)

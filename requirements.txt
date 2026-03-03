@@ -9,3 +9,6 @@ PyMuPDF
 openpyxl
 pytest
 python-dotenv
+
+rq
+redis
