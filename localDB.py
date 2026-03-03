@@ -1,12 +1,13 @@
 import hashlib
 import io
 import json
+from dataclasses import asdict, dataclass
 import logging
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import pandas as pd
 from extrator_regex import extrair_dados_financeiros
@@ -28,10 +29,37 @@ STATUS_FINALIZED = "FINALIZED"
 STATUS_ERROR_STORAGE = "ERROR_STORAGE"
 STATUS_ERROR_PROCESSING = "ERROR_PROCESSING"
 
+MIN_ITEMS = 5
+MIN_CONF = 0.70
+MIN_VALUES_RATIO = 0.85
+MIN_DATES_RATIO = 0.70
+
 logger = logging.getLogger(__name__)
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+
+
+ExtractionMethod = Literal["regex", "llm"]
+
+
+@dataclass
+class ExtractionMetrics:
+    total_items: int
+    valid_items: int
+    coverage: float
+    has_dates_ratio: float
+    has_values_ratio: float
+    confidence: float
+
+
+@dataclass
+class ExtractionResult:
+    method: ExtractionMethod
+    payload: List[Dict[str, Any]]
+    metrics: ExtractionMetrics
+    reason: Optional[str] = None
+
 
 
 def init_db():
@@ -456,9 +484,31 @@ def init_ingest_db():
                 payload_uri TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 llm_checks_uri TEXT,
+                metrics_json TEXT,
+                text_hash TEXT,
+                llm_model TEXT,
                 status TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(document_id) REFERENCES documents(id)
+            );
+            """
+        )
+
+        extraction_cols = {row[1] for row in conn.execute("PRAGMA table_info(extractions)").fetchall()}
+        if "metrics_json" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN metrics_json TEXT")
+        if "text_hash" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN text_hash TEXT")
+        if "llm_model" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN llm_model TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                text_hash TEXT PRIMARY KEY,
+                llm_payload_uri TEXT NOT NULL,
+                llm_model TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -727,28 +777,125 @@ def _save_text_artifact(document_id: str, doc_sha: str, kind: str, relative_path
     return _save_artifact(document_id, doc_sha, kind, relative_path, text.encode("utf-8"), meta=meta)
 
 
-def _is_low_quality_payload(payload: List[Dict[str, Any]]) -> bool:
-    if not payload:
-        return True
-    low_quality = 0
+def _compute_confidence(metrics: ExtractionMetrics) -> float:
+    return min(1.0, (0.4 * metrics.coverage) + (0.3 * metrics.has_dates_ratio) + (0.3 * metrics.has_values_ratio))
+
+
+def _compute_extraction_metrics(payload: List[Dict[str, Any]]) -> ExtractionMetrics:
+    total_items = len(payload)
+    valid_items = 0
+    items_with_dates = 0
+    items_with_values = 0
+
     for item in payload:
         data = str(item.get("data") or "").strip()
         descricao = str(item.get("descricao") or "").strip()
+        valor_raw = item.get("valor", None)
 
-        if not data:
-            low_quality += 1
-        else:
+        has_date = False
+        if data:
             try:
                 datetime.strptime(data, "%Y-%m-%d")
+                has_date = True
             except ValueError:
-                low_quality += 1
+                has_date = False
 
-        if len(descricao) > 120:
-            low_quality += 1
+        has_value = False
+        try:
+            float(valor_raw)
+            has_value = True
+        except (TypeError, ValueError):
+            has_value = False
 
-    return (low_quality / max(1, len(payload))) > 0.2
+        if has_date:
+            items_with_dates += 1
+        if has_value:
+            items_with_values += 1
+        if has_date and has_value and bool(descricao):
+            valid_items += 1
+
+    coverage = valid_items / max(1, total_items)
+    has_dates_ratio = items_with_dates / max(1, total_items)
+    has_values_ratio = items_with_values / max(1, total_items)
+
+    metrics = ExtractionMetrics(
+        total_items=total_items,
+        valid_items=valid_items,
+        coverage=coverage,
+        has_dates_ratio=has_dates_ratio,
+        has_values_ratio=has_values_ratio,
+        confidence=0.0,
+    )
+    metrics.confidence = _compute_confidence(metrics)
+    return metrics
 
 
+def _requires_llm(metrics: ExtractionMetrics) -> Optional[str]:
+    if metrics.total_items == 0:
+        return "regex_empty"
+    if metrics.valid_items < MIN_ITEMS:
+        return "low_valid_items"
+    if metrics.confidence < MIN_CONF:
+        return "low_confidence"
+    if metrics.has_values_ratio < MIN_VALUES_RATIO:
+        return "low_values_ratio"
+    if metrics.has_dates_ratio < MIN_DATES_RATIO:
+        return "low_dates_ratio"
+    return None
+
+
+def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default") -> None:
+    init_ingest_db()
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (text_hash, llm_payload_uri, llm_model, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (text_hash, payload_uri, llm_model),
+        )
+
+
+def _get_llm_cached_payload(text_hash: str) -> Optional[Tuple[List[Dict[str, Any]], str, str]]:
+    init_ingest_db()
+    with sqlite3.connect(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT llm_payload_uri, COALESCE(llm_model, 'default') FROM llm_cache WHERE text_hash = ?",
+            (text_hash,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    payload_uri, llm_model = row
+    if not os.path.exists(payload_uri):
+        return None
+
+    with open(payload_uri, "r", encoding="utf-8") as handler:
+        payload = json.load(handler)
+    if not isinstance(payload, list):
+        return None
+
+    return payload, payload_uri, llm_model
+
+
+def extract_transactions(text: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> ExtractionResult:
+    if df is not None:
+        candidate = df[["data", "valor", "descricao", "categoria", "tipo"]].copy()
+        candidate["data"] = pd.to_datetime(candidate["data"], errors="coerce").dt.strftime("%Y-%m-%d")
+        payload = candidate.fillna("").to_dict(orient="records")
+        metrics = _compute_extraction_metrics(payload)
+        return ExtractionResult(method="regex", payload=payload, metrics=metrics, reason="spreadsheet")
+
+    text = text or ""
+    payload = extrair_dados_financeiros(text)
+    metrics = _compute_extraction_metrics(payload)
+    reason = _requires_llm(metrics)
+    if reason:
+        llm_payload, llm_err = extrair_dados_financeiros_llm(text)
+        if llm_payload:
+            llm_metrics = _compute_extraction_metrics(llm_payload)
+            return ExtractionResult(method="llm", payload=llm_payload, metrics=llm_metrics, reason=reason)
+        if llm_err:
+            logger.warning("[PIPELINE] LLM indisponível após gating (%s): %s", reason, llm_err)
+    return ExtractionResult(method="regex", payload=payload, metrics=metrics, reason=reason)
 def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     logger.info("[LLM_REVIEW] Iniciando validações automáticas para %s transação(ões).", len(payload))
     issues = []
@@ -831,14 +978,24 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-def _record_extraction(document_id: str, extractor: str, payload_uri: str, confidence: float, llm_checks_uri: str) -> None:
+def _record_extraction(
+    document_id: str,
+    extractor: str,
+    payload_uri: str,
+    confidence: float,
+    llm_checks_uri: str,
+    metrics: Optional[ExtractionMetrics] = None,
+    text_hash: Optional[str] = None,
+    llm_model: Optional[str] = None,
+) -> None:
+    metrics_json = json.dumps(asdict(metrics), ensure_ascii=False) if metrics else None
     with sqlite3.connect(INGEST_DB_NAME) as conn:
         conn.execute(
             """
-            INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, metrics_json, text_hash, llm_model, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, "PENDING"),
+            (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, metrics_json, text_hash, llm_model, "PENDING"),
         )
 
 
@@ -883,7 +1040,8 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
 
     try:
         text_content = ""
-        extractor = "regex"
+        text_hash = None
+        llm_model = None
         ext = os.path.splitext(original_name.lower())[1]
 
         class _UploadWrap(io.BytesIO):
@@ -901,105 +1059,61 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
             df_plan, err = processar_planilha(upload)
             if err:
                 raise RuntimeError(err)
-            candidate = df_plan[["data", "valor", "descricao", "categoria", "tipo"]].copy()
-            candidate["data"] = pd.to_datetime(candidate["data"], errors="coerce").dt.strftime("%Y-%m-%d")
-            payload = candidate.fillna("").to_dict(orient="records")
-        elif ext == ".pdf":
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
-            if err_pdf:
-                raise RuntimeError(err_pdf)
-            text_content = text_pdf
-            if is_scanned:
-                upload.seek(0)
-                imgs, err_img = converter_pdf_para_imagens(upload)
-                if err_img:
-                    raise RuntimeError(err_img)
-                chunks = []
-                for idx, img_buffer in enumerate(imgs, start=1):
-                    img_bytes = img_buffer.getvalue()
-                    _save_artifact(document_id, sha, "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
-                    img_buffer.seek(0)
-                    txt, _, _ = extrair_texto_imagem(img_buffer)
-                    if txt:
-                        chunks.append(txt)
-                text_content = "\n".join(chunks)
-
-            _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
-            text_hash = compute_text_hash(text_content)
-            update_document_hashes(document_id, text_hash=text_hash)
-            save_content_cache(text_hash, "text", os.path.join("data", "artifacts", sha, "ocr", "text.txt"))
-
-            existing_by_text = find_document_by_text_hash(text_hash, exclude_document_id=document_id)
-            if existing_by_text and existing_by_text.get("payload_hash"):
-                reused = get_latest_extraction_payload(existing_by_text["id"])
-                if reused:
-                    _, payload, checks = reused
-                    payload_reused = True
-                    extractor = "cache_text_hash"
-                    logger.info("[PIPELINE] Reuso de payload por text_hash. from=%s to=%s", existing_by_text["id"], document_id)
-
-            if not payload_reused:
-                payload = extrair_dados_financeiros(text_content)
-                needs_llm_refine = _is_low_quality_payload(payload)
-                if not payload or needs_llm_refine:
-                    motivo = "sem resultado" if not payload else "qualidade baixa"
-                    logger.info(
-                        "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
-                        motivo,
-                        document_id,
-                    )
-                    llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                    if llm_err and not llm_payload and not payload:
-                        logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
-                        payload = []
-                    elif llm_err and payload:
-                        logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
-                    elif llm_payload:
-                        payload = llm_payload
-                        extractor = "llm"
-                        logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
+            result = extract_transactions(df=df_plan)
         else:
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            txt, _, ocr_err = extrair_texto_imagem(upload)
-            if ocr_err:
-                raise RuntimeError(ocr_err)
-            text_content = txt
-            _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
+            if ext == ".pdf":
+                upload = _UploadWrap(raw_bytes, original_name, mime)
+                text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
+                if err_pdf:
+                    raise RuntimeError(err_pdf)
+                text_content = text_pdf
+                if is_scanned:
+                    upload.seek(0)
+                    imgs, err_img = converter_pdf_para_imagens(upload)
+                    if err_img:
+                        raise RuntimeError(err_img)
+                    chunks = []
+                    for idx, img_buffer in enumerate(imgs, start=1):
+                        img_bytes = img_buffer.getvalue()
+                        _save_artifact(document_id, sha, "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
+                        img_buffer.seek(0)
+                        txt, _, _ = extrair_texto_imagem(img_buffer)
+                        if txt:
+                            chunks.append(txt)
+                    text_content = "\n".join(chunks)
+                _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
+            else:
+                upload = _UploadWrap(raw_bytes, original_name, mime)
+                txt, _, ocr_err = extrair_texto_imagem(upload)
+                if ocr_err:
+                    raise RuntimeError(ocr_err)
+                text_content = txt
+                _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
+
             text_hash = compute_text_hash(text_content)
             update_document_hashes(document_id, text_hash=text_hash)
             save_content_cache(text_hash, "text", os.path.join("data", "artifacts", sha, "ocr", "text.txt"))
 
-            existing_by_text = find_document_by_text_hash(text_hash, exclude_document_id=document_id)
-            if existing_by_text and existing_by_text.get("payload_hash"):
-                reused = get_latest_extraction_payload(existing_by_text["id"])
-                if reused:
-                    _, payload, checks = reused
-                    payload_reused = True
-                    extractor = "cache_text_hash"
-                    logger.info("[PIPELINE] Reuso de payload por text_hash. from=%s to=%s", existing_by_text["id"], document_id)
-
-            if not payload_reused:
-                payload = extrair_dados_financeiros(text_content)
-                needs_llm_refine = _is_low_quality_payload(payload)
-                if not payload or needs_llm_refine:
-                    motivo = "sem resultado" if not payload else "qualidade baixa"
-                    logger.info(
-                        "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
-                        motivo,
-                        document_id,
+            regex_result = extract_transactions(text=text_content)
+            if regex_result.method == "llm" and regex_result.reason:
+                cached = _get_llm_cached_payload(text_hash)
+                if cached:
+                    cached_payload, _, cached_model = cached
+                    cached_metrics = _compute_extraction_metrics(cached_payload)
+                    result = ExtractionResult(
+                        method="llm",
+                        payload=cached_payload,
+                        metrics=cached_metrics,
+                        reason=f"{regex_result.reason}:llm_cache",
                     )
-                    llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                    if llm_err and not llm_payload and not payload:
-                        logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
-                        payload = []
-                    elif llm_err and payload:
-                        logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
-                    elif llm_payload:
-                        payload = llm_payload
-                        extractor = "llm"
-                        logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
+                    llm_model = cached_model
+                    logger.info("[PIPELINE] LLM cache hit para text_hash=%s", text_hash)
+                else:
+                    result = regex_result
+            else:
+                result = regex_result
 
+        payload = result.payload
         payload_hash = compute_payload_hash(payload)
         update_document_hashes(document_id, payload_hash=payload_hash)
 
@@ -1011,21 +1125,32 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
         _write_json(checks_uri, checks)
         save_content_cache(payload_hash, "payload", payload_uri)
 
-        _save_text_artifact(document_id, sha, "extracted_json", "extraction/candidate.json", json.dumps(payload, ensure_ascii=False), meta={"extractor": extractor})
+        if text_hash and result.method == "llm":
+            _save_llm_cache(text_hash, payload_uri, llm_model or "default")
+
+        _save_text_artifact(document_id, sha, "extracted_json", "extraction/candidate.json", json.dumps(payload, ensure_ascii=False), meta={"extractor": result.method, "reason": result.reason})
         _save_text_artifact(document_id, sha, "llm_checks", "extraction/llm_checks.json", json.dumps(checks, ensure_ascii=False), meta={"extractor": "checks"})
-        _record_extraction(document_id, extractor, payload_uri, checks.get("confidence", 0.95), checks_uri)
-        logger.info(
-            "[PIPELINE] Documento %s processado. extractor=%s payload_items=%s confidence=%.2f",
+        _record_extraction(
             document_id,
-            extractor,
+            result.method,
+            payload_uri,
+            result.metrics.confidence,
+            checks_uri,
+            metrics=result.metrics,
+            text_hash=text_hash,
+            llm_model=llm_model,
+        )
+        logger.info(
+            "[PIPELINE] Documento %s processado. extractor=%s payload_items=%s confidence=%.2f reason=%s",
+            document_id,
+            result.method,
             len(payload),
-            checks.get("confidence", 0.95),
+            result.metrics.confidence,
+            result.reason,
         )
 
         _update_ingest_status(document_id, STATUS_LLM_REVIEW)
-        logger.info("[LLM_REVIEW] Documento %s movido para LLM_REVIEW.", document_id)
         _update_ingest_status(document_id, STATUS_HITL_REVIEW)
-        logger.info("[LLM_REVIEW] Documento %s movido para HITL_REVIEW.", document_id)
         return True, "Pipeline concluída e enviado para HITL_REVIEW."
     except Exception as exc:
         _update_ingest_status(document_id, STATUS_ERROR_PROCESSING, str(exc))
@@ -1046,15 +1171,21 @@ def process_stored_documents(limit: int = 20) -> Dict[str, int]:
     return {"processed": processed, "failed": failed, "found": len(docs)}
 
 
-def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any]]]:
+def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any], str, float, Dict[str, Any]]]:
     with sqlite3.connect(INGEST_DB_NAME) as conn:
         row = conn.execute(
-            "SELECT payload_uri, llm_checks_uri FROM extractions WHERE document_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            """
+            SELECT payload_uri, llm_checks_uri, extractor, confidence, metrics_json
+            FROM extractions
+            WHERE document_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
             (document_id,),
         ).fetchone()
     if not row:
         return None
-    payload_uri, checks_uri = row
+    payload_uri, checks_uri, extractor, confidence, metrics_json = row
     if not os.path.exists(payload_uri):
         return None
     with open(payload_uri, "r", encoding="utf-8") as handler:
@@ -1063,7 +1194,15 @@ def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[
     if checks_uri and os.path.exists(checks_uri):
         with open(checks_uri, "r", encoding="utf-8") as handler:
             checks = json.load(handler)
-    return payload_uri, payload, checks
+
+    metrics = {}
+    if metrics_json:
+        try:
+            metrics = json.loads(metrics_json)
+        except Exception:
+            metrics = {}
+
+    return payload_uri, payload, checks, str(extractor or "unknown"), float(confidence or 0.0), metrics
 
 
 def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_payload: List[Dict[str, Any]], notes: str = "") -> str:

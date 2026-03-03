@@ -250,8 +250,11 @@ def render_review():
         st.warning("Sem payload de extração para este documento.")
         return
 
-    payload_uri, payload, checks = payload_info
+    payload_uri, payload, checks, extractor, confidence, metrics = payload_info
     st.caption(f"Payload: {payload_uri}")
+    st.caption(f"Método: {extractor} | Confiança: {confidence:.2f}")
+    if metrics:
+        st.json({"metrics": metrics})
 
     with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
         st.json(checks)
