@@ -1050,6 +1050,10 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                 self.name = name
                 self.type = mime_type
 
+        payload = []
+        checks = {}
+        payload_reused = False
+
         if ext in [".csv", ".xlsx"]:
             upload = _UploadWrap(raw_bytes, original_name, mime)
             df_plan, err = processar_planilha(upload)
@@ -1115,7 +1119,8 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
 
         payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
         checks_uri = os.path.join("data", "artifacts", sha, "extraction", "llm_checks.json")
-        checks = _run_llm_checks(payload)
+        if not checks:
+            checks = _run_llm_checks(payload)
         _write_json(payload_uri, payload)
         _write_json(checks_uri, checks)
         save_content_cache(payload_hash, "payload", payload_uri)
