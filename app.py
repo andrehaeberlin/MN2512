@@ -11,6 +11,7 @@ from redis import Redis
 from rq import Queue
 from localDB import (
     STATUS_FINALIZE_PENDING,
+    STATUS_FINALIZED,
     STATUS_HITL_REVIEW,
     STATUS_PROCESSING,
     STATUS_STORED,
@@ -177,6 +178,12 @@ def render_import_store():
             doc = store_raw_document(arq.name, arq.type or "application/octet-stream", arq.getvalue())
             if doc["is_duplicate"]:
                 duplicados += 1
+                if doc.get("status") not in [STATUS_FINALIZED, STATUS_PROCESSING]:
+                    try:
+                        queue.enqueue(process_document_job, doc["id"], job_timeout=900)
+                        enfileirados += 1
+                    except Exception:
+                        falhas_fila += 1
                 continue
 
             salvos += 1
