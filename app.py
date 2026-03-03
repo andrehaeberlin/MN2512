@@ -2,12 +2,16 @@ import base64
 import datetime
 import io
 import json
+import os
 from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
+from redis import Redis
+from rq import Queue
 from localDB import (
     STATUS_FINALIZE_PENDING,
+    STATUS_FINALIZED,
     STATUS_HITL_REVIEW,
     STATUS_PROCESSING,
     STATUS_STORED,
@@ -19,11 +23,11 @@ from localDB import (
     init_db,
     init_ingest_db,
     list_ingest_documents,
-    process_stored_documents,
     insert_transactions,
     store_raw_document,
     submit_hitl_review,
 )
+from tasks import process_document_job
 
 init_db()
 init_ingest_db()
@@ -133,6 +137,15 @@ def render_preview(arq):
     st.download_button("Baixar arquivo", data=arq.getvalue(), file_name=arq.name)
 
 
+def _get_redis_url() -> str:
+    return st.secrets.get("REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+
+def _get_queue() -> Queue:
+    redis_conn = Redis.from_url(_get_redis_url())
+    return Queue("mn2512", connection=redis_conn)
+
+
 def render_import_store():
     st.title("IMPORT / STORE (raw)")
     arquivos = st.file_uploader(
@@ -152,29 +165,63 @@ def render_import_store():
     if st.button("💾 Importar e Armazenar", type="primary"):
         salvos = 0
         duplicados = 0
+        enfileirados = 0
+        falhas_fila = 0
+
+        try:
+            queue = _get_queue()
+        except Exception as exc:
+            st.error(f"Falha ao conectar no Redis/RQ: {exc}")
+            return
+
         for arq in arquivos:
             doc = store_raw_document(arq.name, arq.type or "application/octet-stream", arq.getvalue())
             if doc["is_duplicate"]:
                 duplicados += 1
-            else:
-                salvos += 1
-        st.success(f"Salvo com sucesso. Novos: {salvos} | Duplicados (sha256): {duplicados}")
+                if doc.get("status") not in [STATUS_FINALIZED, STATUS_PROCESSING]:
+                    try:
+                        queue.enqueue(process_document_job, doc["id"], job_timeout=900)
+                        enfileirados += 1
+                    except Exception:
+                        falhas_fila += 1
+                continue
+
+            salvos += 1
+            try:
+                queue.enqueue(process_document_job, doc["id"], job_timeout=900)
+                enfileirados += 1
+            except Exception:
+                falhas_fila += 1
+
+        st.success(
+            f"Salvo com sucesso. Novos: {salvos} | Duplicados (sha256): {duplicados} | "
+            f"Enfileirados: {enfileirados} | Falhas fila: {falhas_fila}"
+        )
 
 
 def render_pipeline():
     st.title("Pipeline")
-    docs = list_ingest_documents([STATUS_STORED, STATUS_PROCESSING, STATUS_HITL_REVIEW])
-    if docs:
-        st.dataframe(pd.DataFrame(docs), width="stretch")
-    else:
-        st.info("Sem documentos nesses estados.")
+    st.caption("Acompanhe o status da fila. O processamento é feito por um worker separado (RQ).")
 
-    if st.button("⚙️ Processar pendências (STORED)"):
-        result = process_stored_documents(limit=50)
-        st.success(
-            f"Processamento concluído. Encontrados={result['found']} Processados={result['processed']} Falhas={result['failed']}"
-        )
-        st.rerun()
+    st.autorefresh(interval=5000, key="pipeline_autorefresh")
+
+    docs = list_ingest_documents()
+    if not docs:
+        st.info("Sem documentos na ingestão.")
+        return
+
+    df_docs = pd.DataFrame(docs)
+    counts = df_docs["status"].value_counts()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("STORED", int(counts.get(STATUS_STORED, 0)))
+    c2.metric("PROCESSING", int(counts.get(STATUS_PROCESSING, 0)))
+    c3.metric("HITL_REVIEW", int(counts.get(STATUS_HITL_REVIEW, 0)))
+    error_count = int(df_docs["status"].astype(str).str.startswith("ERROR").sum())
+    c4.metric("ERROR_*", error_count)
+
+    st.subheader("Documentos")
+    st.dataframe(df_docs, width="stretch")
 
 
 def render_review():
@@ -203,8 +250,11 @@ def render_review():
         st.warning("Sem payload de extração para este documento.")
         return
 
-    payload_uri, payload, checks = payload_info
+    payload_uri, payload, checks, extractor, confidence, metrics = payload_info
     st.caption(f"Payload: {payload_uri}")
+    st.caption(f"Método: {extractor} | Confiança: {confidence:.2f}")
+    if metrics:
+        st.json({"metrics": metrics})
 
     with st.expander("Ver checks automáticos (LLM_REVIEW)", expanded=False):
         st.json(checks)
