@@ -1,12 +1,15 @@
 import hashlib
 import io
 import json
+from dataclasses import asdict, dataclass
 import logging
+import random
 import os
 import sqlite3
 import uuid
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import pandas as pd
 from extrator_regex import extrair_dados_financeiros
@@ -20,13 +23,25 @@ DB_NAME = "dados_financeiros.db"
 INGEST_DB_NAME = "ingestao.db"
 
 STATUS_STORED = "STORED"
-STATUS_PROCESSING = "PROCESSING"
-STATUS_LLM_REVIEW = "LLM_REVIEW"
+STATUS_PROCESSING_TEXT = "PROCESSING_TEXT"
+STATUS_TEXT_EXTRACTED = "TEXT_EXTRACTED"
+STATUS_PROCESSING_EXTRACTION = "PROCESSING_EXTRACTION"
+STATUS_STRUCTURED_EXTRACTED = "STRUCTURED_EXTRACTED"
 STATUS_HITL_REVIEW = "HITL_REVIEW"
 STATUS_FINALIZE_PENDING = "FINALIZE_PENDING"
 STATUS_FINALIZED = "FINALIZED"
 STATUS_ERROR_STORAGE = "ERROR_STORAGE"
 STATUS_ERROR_PROCESSING = "ERROR_PROCESSING"
+
+# Compatibilidade legada
+STATUS_PROCESSING = STATUS_PROCESSING_TEXT
+STATUS_LLM_REVIEW = STATUS_STRUCTURED_EXTRACTED
+
+MIN_ITEMS = 5
+MIN_CONF = 0.70
+MIN_VALUES_RATIO = 0.85
+MIN_DATES_RATIO = 0.70
+MAX_ACTIVE_DOCS = int(os.getenv("MAX_ACTIVE_DOCS", "2"))
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +49,82 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 
 
+ExtractionMethod = Literal["regex", "llm"]
+
+
+@dataclass
+class ExtractionMetrics:
+    total_items: int
+    valid_items: int
+    coverage: float
+    has_dates_ratio: float
+    has_values_ratio: float
+    confidence: float
+
+
+@dataclass
+class ExtractionResult:
+    method: ExtractionMethod
+    payload: List[Dict[str, Any]]
+    metrics: ExtractionMetrics
+    reason: Optional[str] = None
+
+
+
+
+
+def get_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+
+
+def with_tx(conn: sqlite3.Connection, fn):
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        result = fn(conn)
+        conn.execute("COMMIT;")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+
+
+def retry_on_lock(fn, attempts: int = 6, base_delay: float = 0.2):
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            sleep_for = base_delay * (2 ** i) + random.random() * 0.1
+            time.sleep(sleep_for)
+    if last_exc:
+        raise last_exc
+
 def init_db():
     """Inicializa/migra o banco principal da aplicação."""
     folder = os.path.dirname(DB_NAME)
     if folder and not os.path.exists(folder):
         os.makedirs(folder)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
+        apply_sqlite_pragmas(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transacoes (
@@ -67,6 +151,7 @@ def init_db():
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tipo_data ON transacoes(tipo, data);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_categoria_data ON transacoes(categoria, data);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transacoes_document_id ON transacoes(document_id);")
 
         conn.execute(
             """
@@ -174,6 +259,20 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def compute_raw_hash(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def compute_text_hash(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def compute_payload_hash(payload: Any) -> str:
+    normalized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def insert_document(file_name: str, mime: str, file_bytes: bytes, storage_dir: str = "storage") -> int:
     """Salva documento no disco e registra no DB com deduplicação por hash."""
     if not os.path.exists(storage_dir):
@@ -186,7 +285,7 @@ def insert_document(file_name: str, mime: str, file_bytes: bytes, storage_dir: s
         with open(storage_path, "wb") as handler:
             handler.write(file_bytes)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO documents (nome, mime, sha256, storage_path) VALUES (?, ?, ?, ?)",
             (file_name, mime or "application/octet-stream", sha, storage_path),
@@ -198,7 +297,7 @@ def insert_document(file_name: str, mime: str, file_bytes: bytes, storage_dir: s
 
 def get_document_bytes(document_id: int) -> Tuple[bytes, str, str]:
     """Retorna (bytes, mime, nome) para visualização/download."""
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         row = conn.execute(
             "SELECT storage_path, mime, nome FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
@@ -212,7 +311,7 @@ def get_document_bytes(document_id: int) -> Tuple[bytes, str, str]:
 
 
 def link_entities(from_type: str, from_id: int, to_type: str, to_id: int) -> None:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO links (from_type, from_id, to_type, to_id) VALUES (?, ?, ?, ?)",
             (from_type, int(from_id), to_type, int(to_id)),
@@ -220,7 +319,7 @@ def link_entities(from_type: str, from_id: int, to_type: str, to_id: int) -> Non
 
 
 def find_transaction_id(data: str, descricao: str, valor: float, fonte: str, tipo: str = "saida") -> Optional[int]:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         row = conn.execute(
             "SELECT id FROM transacoes WHERE data = ? AND descricao = ? AND valor = ? AND fonte = ? AND tipo = ?",
             (data, descricao, float(valor), fonte, tipo),
@@ -255,18 +354,25 @@ def insert_transactions(df: pd.DataFrame):
     df_final.loc[~df_final["tipo"].isin(["entrada", "saida"]), "tipo"] = "saida"
 
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            df_final.to_sql("staging_transacoes", conn, if_exists="replace", index=False)
+        def _op():
+            with get_conn(DB_NAME) as conn:
+                apply_sqlite_pragmas(conn)
 
-            query_upsert = """
-            INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria, tipo)
-            SELECT data, descricao, valor, fonte, categoria, tipo FROM staging_transacoes;
-            """
-            cursor = conn.execute(query_upsert)
-            novas_linhas = cursor.rowcount
+                df_final.to_sql("staging_transacoes", conn, if_exists="replace", index=False)
 
-            conn.execute("DROP TABLE staging_transacoes;")
-            return novas_linhas
+                def _write(c):
+                    cursor = c.execute(
+                        """
+                        INSERT OR IGNORE INTO transacoes (data, descricao, valor, fonte, categoria, tipo)
+                        SELECT data, descricao, valor, fonte, categoria, tipo FROM staging_transacoes;
+                        """
+                    )
+                    c.execute("DROP TABLE IF EXISTS staging_transacoes;")
+                    return int(cursor.rowcount)
+
+                return with_tx(conn, _write)
+
+        return retry_on_lock(_op)
     except Exception as exc:
         raise Exception(f"Erro técnico na camada de dados: {exc}")
 
@@ -274,7 +380,7 @@ def insert_transactions(df: pd.DataFrame):
 def get_all_transactions():
     """Busca o histórico completo."""
     try:
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query("SELECT * FROM transacoes ORDER BY data DESC", conn)
     except Exception:
         return pd.DataFrame()
@@ -282,7 +388,7 @@ def get_all_transactions():
 
 def get_document_summaries() -> pd.DataFrame:
     try:
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query(
                 """
                 SELECT
@@ -327,14 +433,14 @@ def get_document_items(document_id: Optional[str] = None) -> pd.DataFrame:
             params = (str(document_id),)
         query += " ORDER BY di.criado_em DESC, di.id DESC"
 
-        with sqlite3.connect(DB_NAME) as conn:
+        with get_conn(DB_NAME) as conn:
             return pd.read_sql_query(query, conn, params=params)
     except Exception:
         return pd.DataFrame()
 
 
 def insert_statement(document_id: int, banco: Optional[str], cartao: Optional[str], competencia: str) -> int:
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         cur = conn.execute(
             "INSERT INTO statements (document_id, banco, cartao, competencia) VALUES (?, ?, ?, ?)",
             (int(document_id), banco, cartao, competencia),
@@ -361,7 +467,7 @@ def insert_statement_lines(statement_id: int, competencia: str, lines: Iterable[
     if not payload:
         return 0
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         cur = conn.executemany(
             """
             INSERT OR IGNORE INTO statement_lines
@@ -375,7 +481,8 @@ def insert_statement_lines(statement_id: int, competencia: str, lines: Iterable[
 
 def init_ingest_db():
     """Inicializa/migra o banco de ingestão da pipeline."""
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
+        apply_sqlite_pragmas(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS documents (
@@ -393,6 +500,38 @@ def init_ingest_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ingest_documents_status ON documents(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ingest_documents_status_created ON documents(status, created_at);")
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        if "raw_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN raw_hash TEXT")
+        if "text_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN text_hash TEXT")
+        if "payload_hash" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN payload_hash TEXT")
+        if "text_uri" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN text_uri TEXT")
+        if "extraction_uri" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN extraction_uri TEXT")
+        if "failed_stage" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN failed_stage TEXT")
+        if "metrics_json" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN metrics_json TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_payload_hash ON documents(payload_hash);")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_cache (
+                hash TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
 
         conn.execute(
             """
@@ -419,9 +558,31 @@ def init_ingest_db():
                 payload_uri TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 llm_checks_uri TEXT,
+                metrics_json TEXT,
+                text_hash TEXT,
+                llm_model TEXT,
                 status TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(document_id) REFERENCES documents(id)
+            );
+            """
+        )
+
+        extraction_cols = {row[1] for row in conn.execute("PRAGMA table_info(extractions)").fetchall()}
+        if "metrics_json" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN metrics_json TEXT")
+        if "text_hash" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN text_hash TEXT")
+        if "llm_model" not in extraction_cols:
+            conn.execute("ALTER TABLE extractions ADD COLUMN llm_model TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                text_hash TEXT PRIMARY KEY,
+                llm_payload_uri TEXT NOT NULL,
+                llm_model TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -440,6 +601,7 @@ def init_ingest_db():
             );
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_document_created ON reviews(document_id, created_at);")
 
 
 def _safe_name(filename: str) -> str:
@@ -468,15 +630,23 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
     """Primeiro salva raw e depois registra no DB de ingestão com status STORED."""
     init_ingest_db()
     sha = _sha256_bytes(file_bytes)
+    raw_hash = compute_raw_hash(file_bytes)
     ext = os.path.splitext(_safe_name(file_name))[1] or ".bin"
     raw_path = os.path.join(storage_root, "raw", sha, f"original{ext}")
     if not os.path.exists(raw_path):
         _write_bytes(raw_path, file_bytes)
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         existing = conn.execute(
-            "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, created_at, updated_at FROM documents WHERE sha256 = ?",
-            (sha,),
+            """
+            SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
+                   created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json
+            FROM documents
+            WHERE raw_hash = ? OR sha256 = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (raw_hash, sha),
         ).fetchone()
 
         if existing:
@@ -488,19 +658,46 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
                 "size_bytes": existing[4],
                 "storage_uri_raw": existing[5],
                 "status": existing[6],
-                "created_at": existing[7],
-                "updated_at": existing[8],
+                "error_message": existing[7],
+                "created_at": existing[8],
+                "updated_at": existing[9],
+                "raw_hash": existing[10],
+                "text_hash": existing[11],
+                "payload_hash": existing[12],
+                "text_uri": existing[13],
+                "extraction_uri": existing[14],
+                "failed_stage": existing[15],
+                "metrics_json": existing[16],
                 "is_duplicate": True,
             }
 
         ingest_id = str(uuid.uuid4())
         now = _now_iso()
-        payload = (ingest_id, sha, file_name, mime or "application/octet-stream", len(file_bytes), raw_path, STATUS_STORED, None, now, now)
+        payload = (
+            ingest_id,
+            sha,
+            file_name,
+            mime or "application/octet-stream",
+            len(file_bytes),
+            raw_path,
+            STATUS_STORED,
+            None,
+            now,
+            now,
+            raw_hash,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         conn.execute(
             """
             INSERT INTO documents
-            (id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
+             created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -513,15 +710,23 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
         "size_bytes": len(file_bytes),
         "storage_uri_raw": raw_path,
         "status": STATUS_STORED,
+        "error_message": None,
         "created_at": now,
         "updated_at": now,
+        "raw_hash": raw_hash,
+        "text_hash": None,
+        "payload_hash": None,
+        "text_uri": None,
+        "extraction_uri": None,
+        "failed_stage": None,
+        "metrics_json": None,
         "is_duplicate": False,
     }
 
 
 def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     init_ingest_db()
-    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at FROM documents"
+    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json FROM documents"
     params: Tuple[Any, ...] = ()
     if statuses:
         placeholders = ",".join(["?"] * len(statuses))
@@ -529,7 +734,7 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
         params = tuple(statuses)
     query += " ORDER BY created_at DESC"
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         rows = conn.execute(query, params).fetchall()
 
     return [
@@ -544,16 +749,235 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
             "error_message": row[7],
             "created_at": row[8],
             "updated_at": row[9],
+            "raw_hash": row[10],
+            "text_hash": row[11],
+            "payload_hash": row[12],
+            "text_uri": row[13],
+            "extraction_uri": row[14],
+            "failed_stage": row[15],
+            "metrics_json": row[16],
         }
         for row in rows
     ]
 
 
 def _update_ingest_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                c.execute(
+                    "UPDATE documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                    (status, error_message, _now_iso(), document_id),
+                )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def update_document_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
+    """Atualiza status de um documento na fila de ingestão."""
+    init_ingest_db()
+    _update_ingest_status(str(document_id), status, error_message)
+
+
+def _update_document_fields(document_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+
+    init_ingest_db()
+
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                payload = dict(fields)
+                payload["updated_at"] = _now_iso()
+                assignments = ", ".join([f"{k} = ?" for k in payload.keys()])
+                values = list(payload.values()) + [document_id]
+                c.execute(f"UPDATE documents SET {assignments} WHERE id = ?", values)
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def mark_stage_error(document_id: str, failed_stage: str, error_message: str) -> None:
+    _update_document_fields(
+        document_id,
+        status=STATUS_ERROR_PROCESSING,
+        failed_stage=failed_stage,
+        error_message=error_message,
+    )
+
+
+def reset_document_to_stage(document_id: str, stage: str) -> None:
+    allowed = {
+        STATUS_STORED,
+        STATUS_TEXT_EXTRACTED,
+        STATUS_STRUCTURED_EXTRACTED,
+    }
+    if stage not in allowed:
+        raise ValueError(f"Stage inválido para reset: {stage}")
+
+    _update_document_fields(
+        document_id,
+        status=stage,
+        failed_stage=None,
+        error_message=None,
+    )
+
+
+def update_document_hashes(document_id: str, text_hash: Optional[str] = None, payload_hash: Optional[str] = None) -> None:
+    init_ingest_db()
+
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                if text_hash is not None:
+                    c.execute(
+                        "UPDATE documents SET text_hash = ?, updated_at = ? WHERE id = ?",
+                        (text_hash, _now_iso(), document_id),
+                    )
+                if payload_hash is not None:
+                    c.execute(
+                        "UPDATE documents SET payload_hash = ?, updated_at = ? WHERE id = ?",
+                        (payload_hash, _now_iso(), document_id),
+                    )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def count_processing_docs() -> int:
+    init_ingest_db()
+    statuses = [STATUS_PROCESSING_TEXT, STATUS_PROCESSING_EXTRACTION]
+    placeholders = ",".join(["?"] * len(statuses))
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"SELECT COUNT(1) as total FROM documents WHERE status IN ({placeholders})",
+            tuple(statuses),
+        ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def try_acquire_processing_slot(document_id: str, max_active_docs: Optional[int] = None) -> bool:
+    limit = max_active_docs if max_active_docs is not None else MAX_ACTIVE_DOCS
+    limit = max(1, int(limit))
+
+    def _op() -> bool:
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                active = c.execute(
+                    "SELECT COUNT(1) FROM documents WHERE status IN (?, ?)",
+                    (STATUS_PROCESSING_TEXT, STATUS_PROCESSING_EXTRACTION),
+                ).fetchone()[0]
+                if int(active) >= limit:
+                    return False
+
+                status_row = c.execute("SELECT status FROM documents WHERE id = ?", (document_id,)).fetchone()
+                if not status_row:
+                    return False
+                st = status_row[0]
+                if st in [STATUS_FINALIZED, STATUS_HITL_REVIEW, STATUS_FINALIZE_PENDING]:
+                    return True
+
+                c.execute(
+                    "UPDATE documents SET status = ?, failed_stage = NULL, error_message = NULL, updated_at = ? WHERE id = ?",
+                    (STATUS_PROCESSING_TEXT, _now_iso(), document_id),
+                )
+                return True
+
+            return bool(with_tx(conn, _write))
+
+    return bool(retry_on_lock(_op))
+
+
+def _load_document_metrics(document_id: str) -> Dict[str, Any]:
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute("SELECT metrics_json FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def update_document_metrics(document_id: str, updates: Dict[str, Any], increment: bool = False) -> None:
+    metrics = _load_document_metrics(document_id)
+    for k, v in updates.items():
+        if increment and isinstance(v, (int, float)):
+            metrics[k] = float(metrics.get(k, 0)) + float(v)
+        else:
+            metrics[k] = v
+    _update_document_fields(document_id, metrics_json=json.dumps(metrics, ensure_ascii=False))
+
+
+def find_document_by_text_hash(text_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE text_hash = ?"
+    params: List[Any] = [text_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status, payload_hash
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1], "payload_hash": row[2]}
+
+
+def find_document_by_payload_hash(payload_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    init_ingest_db()
+    where = "WHERE payload_hash = ?"
+    params: List[Any] = [payload_hash]
+    if exclude_document_id:
+        where += " AND id <> ?"
+        params.append(exclude_document_id)
+
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, status
+            FROM documents
+            {where}
+            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (*params, STATUS_FINALIZED),
+        ).fetchone()
+
+    if not row:
+        return None
+    return {"id": row[0], "status": row[1]}
+
+
+def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
+    init_ingest_db()
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
-            "UPDATE documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
-            (status, error_message, _now_iso(), document_id),
+            "INSERT OR REPLACE INTO content_cache (hash, type, uri) VALUES (?, ?, ?)",
+            (content_hash, content_type, uri),
         )
 
 
@@ -561,7 +985,7 @@ def _save_artifact(document_id: str, doc_sha: str, kind: str, relative_path: str
     storage_uri = os.path.join("data", "artifacts", doc_sha, relative_path)
     _write_bytes(storage_uri, content)
     art_sha = _sha256_bytes(content)
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO artifacts (document_id, kind, storage_uri, sha256, meta_json)
@@ -576,28 +1000,125 @@ def _save_text_artifact(document_id: str, doc_sha: str, kind: str, relative_path
     return _save_artifact(document_id, doc_sha, kind, relative_path, text.encode("utf-8"), meta=meta)
 
 
-def _is_low_quality_payload(payload: List[Dict[str, Any]]) -> bool:
-    if not payload:
-        return True
-    low_quality = 0
+def _compute_confidence(metrics: ExtractionMetrics) -> float:
+    return min(1.0, (0.4 * metrics.coverage) + (0.3 * metrics.has_dates_ratio) + (0.3 * metrics.has_values_ratio))
+
+
+def _compute_extraction_metrics(payload: List[Dict[str, Any]]) -> ExtractionMetrics:
+    total_items = len(payload)
+    valid_items = 0
+    items_with_dates = 0
+    items_with_values = 0
+
     for item in payload:
         data = str(item.get("data") or "").strip()
         descricao = str(item.get("descricao") or "").strip()
+        valor_raw = item.get("valor", None)
 
-        if not data:
-            low_quality += 1
-        else:
+        has_date = False
+        if data:
             try:
                 datetime.strptime(data, "%Y-%m-%d")
+                has_date = True
             except ValueError:
-                low_quality += 1
+                has_date = False
 
-        if len(descricao) > 120:
-            low_quality += 1
+        has_value = False
+        try:
+            float(valor_raw)
+            has_value = True
+        except (TypeError, ValueError):
+            has_value = False
 
-    return (low_quality / max(1, len(payload))) > 0.2
+        if has_date:
+            items_with_dates += 1
+        if has_value:
+            items_with_values += 1
+        if has_date and has_value and bool(descricao):
+            valid_items += 1
+
+    coverage = valid_items / max(1, total_items)
+    has_dates_ratio = items_with_dates / max(1, total_items)
+    has_values_ratio = items_with_values / max(1, total_items)
+
+    metrics = ExtractionMetrics(
+        total_items=total_items,
+        valid_items=valid_items,
+        coverage=coverage,
+        has_dates_ratio=has_dates_ratio,
+        has_values_ratio=has_values_ratio,
+        confidence=0.0,
+    )
+    metrics.confidence = _compute_confidence(metrics)
+    return metrics
 
 
+def _requires_llm(metrics: ExtractionMetrics) -> Optional[str]:
+    if metrics.total_items == 0:
+        return "regex_empty"
+    if metrics.valid_items < MIN_ITEMS:
+        return "low_valid_items"
+    if metrics.confidence < MIN_CONF:
+        return "low_confidence"
+    if metrics.has_values_ratio < MIN_VALUES_RATIO:
+        return "low_values_ratio"
+    if metrics.has_dates_ratio < MIN_DATES_RATIO:
+        return "low_dates_ratio"
+    return None
+
+
+def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default") -> None:
+    init_ingest_db()
+    with get_conn(INGEST_DB_NAME) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (text_hash, llm_payload_uri, llm_model, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (text_hash, payload_uri, llm_model),
+        )
+
+
+def _get_llm_cached_payload(text_hash: str) -> Optional[Tuple[List[Dict[str, Any]], str, str]]:
+    init_ingest_db()
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT llm_payload_uri, COALESCE(llm_model, 'default') FROM llm_cache WHERE text_hash = ?",
+            (text_hash,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    payload_uri, llm_model = row
+    if not os.path.exists(payload_uri):
+        return None
+
+    with open(payload_uri, "r", encoding="utf-8") as handler:
+        payload = json.load(handler)
+    if not isinstance(payload, list):
+        return None
+
+    return payload, payload_uri, llm_model
+
+
+def extract_transactions(text: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> ExtractionResult:
+    if df is not None:
+        candidate = df[["data", "valor", "descricao", "categoria", "tipo"]].copy()
+        candidate["data"] = pd.to_datetime(candidate["data"], errors="coerce").dt.strftime("%Y-%m-%d")
+        payload = candidate.fillna("").to_dict(orient="records")
+        metrics = _compute_extraction_metrics(payload)
+        return ExtractionResult(method="regex", payload=payload, metrics=metrics, reason="spreadsheet")
+
+    text = text or ""
+    payload = extrair_dados_financeiros(text)
+    metrics = _compute_extraction_metrics(payload)
+    reason = _requires_llm(metrics)
+    if reason:
+        llm_payload, llm_err = extrair_dados_financeiros_llm(text)
+        if llm_payload:
+            llm_metrics = _compute_extraction_metrics(llm_payload)
+            return ExtractionResult(method="llm", payload=llm_payload, metrics=llm_metrics, reason=reason)
+        if llm_err:
+            logger.warning("[PIPELINE] LLM indisponível após gating (%s): %s", reason, llm_err)
+    return ExtractionResult(method="regex", payload=payload, metrics=metrics, reason=reason)
 def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     logger.info("[LLM_REVIEW] Iniciando validações automáticas para %s transação(ões).", len(payload))
     issues = []
@@ -680,162 +1201,245 @@ def _run_llm_checks(payload: List[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-def _record_extraction(document_id: str, extractor: str, payload_uri: str, confidence: float, llm_checks_uri: str) -> None:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        conn.execute(
-            """
-            INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, status)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, "PENDING"),
-        )
+def _record_extraction(
+    document_id: str,
+    extractor: str,
+    payload_uri: str,
+    confidence: float,
+    llm_checks_uri: str,
+    metrics: Optional[ExtractionMetrics] = None,
+    text_hash: Optional[str] = None,
+    llm_model: Optional[str] = None,
+) -> None:
+    metrics_json = json.dumps(asdict(metrics), ensure_ascii=False) if metrics else None
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                c.execute(
+                    """
+                    INSERT INTO extractions (document_id, extractor, payload_uri, confidence, llm_checks_uri, metrics_json, text_hash, llm_model, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (document_id, extractor, payload_uri, float(confidence), llm_checks_uri, metrics_json, text_hash, llm_model, "PENDING"),
+                )
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
 
 
 def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        doc = conn.execute(
-            "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status FROM documents WHERE id = ?",
-            (document_id,),
-        ).fetchone()
 
+    def _load_doc() -> Optional[sqlite3.Row]:
+        with get_conn(INGEST_DB_NAME) as conn:
+            return conn.execute(
+                """
+                SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status,
+                       raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage
+                FROM documents
+                WHERE id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+
+    doc = _load_doc()
     if not doc:
         return False, "Documento não encontrado na ingestão."
 
-    _, sha, original_name, mime, _, raw_uri, status = doc
-    if status != STATUS_STORED:
-        return False, f"Documento {document_id} não está em STORED."
+    if doc["status"] == STATUS_FINALIZED:
+        return True, "Documento já finalizado (idempotente)."
+    if doc["status"] in [STATUS_HITL_REVIEW, STATUS_FINALIZE_PENDING]:
+        return True, f"Documento já está em {doc['status']}."
 
+    raw_uri = doc["storage_uri_raw"]
     if not os.path.exists(raw_uri):
-        _update_ingest_status(document_id, STATUS_ERROR_STORAGE, "Arquivo raw não encontrado")
+        _update_document_fields(document_id, status=STATUS_ERROR_STORAGE, error_message="Arquivo raw não encontrado", failed_stage="RAW_VALIDATE")
         return False, "Arquivo raw não encontrado."
 
     with open(raw_uri, "rb") as handler:
         raw_bytes = handler.read()
-    if _sha256_bytes(raw_bytes) != sha:
-        _update_ingest_status(document_id, STATUS_ERROR_STORAGE, "SHA256 divergente do raw")
+
+    if _sha256_bytes(raw_bytes) != doc["sha256"]:
+        _update_document_fields(document_id, status=STATUS_ERROR_STORAGE, error_message="SHA256 divergente do raw", failed_stage="RAW_VALIDATE")
         return False, "SHA divergente do raw."
 
-    _update_ingest_status(document_id, STATUS_PROCESSING)
-    logger.info("[PIPELINE] Documento %s (%s) movido para PROCESSING.", document_id, original_name)
+    current_raw_hash = compute_raw_hash(raw_bytes)
+    if doc["raw_hash"] != current_raw_hash:
+        _update_document_fields(document_id, raw_hash=current_raw_hash)
+
+    class _UploadWrap(io.BytesIO):
+        def __init__(self, data: bytes, name: str, mime_type: str):
+            super().__init__(data)
+            self.name = name
+            self.type = mime_type
+
+    ext = os.path.splitext(str(doc["original_name"]).lower())[1]
 
     try:
-        text_content = ""
-        extractor = "regex"
-        ext = os.path.splitext(original_name.lower())[1]
+        update_document_metrics(document_id, {"started_at": _now_iso(), "worker_id": os.getenv("WORKER_ID", "worker")})
+        doc = _load_doc()
 
-        class _UploadWrap(io.BytesIO):
-            def __init__(self, data: bytes, name: str, mime_type: str):
-                super().__init__(data)
-                self.name = name
-                self.type = mime_type
+        # STEP 1: TEXT_EXTRACTION
+        if doc["status"] in [STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_ERROR_PROCESSING]:
+            _update_document_fields(document_id, status=STATUS_PROCESSING_TEXT, failed_stage=None, error_message=None)
 
-        if ext in [".csv", ".xlsx"]:
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            df_plan, err = processar_planilha(upload)
-            if err:
-                raise RuntimeError(err)
-            candidate = df_plan[["data", "valor", "descricao", "categoria", "tipo"]].copy()
-            candidate["data"] = pd.to_datetime(candidate["data"], errors="coerce").dt.strftime("%Y-%m-%d")
-            payload = candidate.fillna("").to_dict(orient="records")
-        elif ext == ".pdf":
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
-            if err_pdf:
-                raise RuntimeError(err_pdf)
-            text_content = text_pdf
-            if is_scanned:
-                upload.seek(0)
-                imgs, err_img = converter_pdf_para_imagens(upload)
-                if err_img:
-                    raise RuntimeError(err_img)
-                chunks = []
-                for idx, img_buffer in enumerate(imgs, start=1):
-                    img_bytes = img_buffer.getvalue()
-                    _save_artifact(document_id, sha, "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
-                    img_buffer.seek(0)
-                    txt, _, _ = extrair_texto_imagem(img_buffer)
+            text_uri = doc["text_uri"]
+            if not text_uri or not os.path.exists(text_uri):
+                if ext in [".csv", ".xlsx"]:
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    df_plan, err = processar_planilha(upload)
+                    if err:
+                        raise RuntimeError(err)
+                    text_content = df_plan.to_csv(index=False)
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
+                elif ext == ".pdf":
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
+                    if err_pdf:
+                        raise RuntimeError(err_pdf)
+                    text_content = text_pdf
+                    if is_scanned:
+                        upload.seek(0)
+                        imgs, err_img = converter_pdf_para_imagens(upload)
+                        if err_img:
+                            raise RuntimeError(err_img)
+                        chunks = []
+                        update_document_metrics(document_id, {"ocr_pages_total": len(imgs)})
+                        for idx, img_buffer in enumerate(imgs, start=1):
+                            img_bytes = img_buffer.getvalue()
+                            _save_artifact(document_id, doc["sha256"], "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
+                            img_buffer.seek(0)
+                            txt, _, _ = extrair_texto_imagem(img_buffer)
+                            if txt:
+                                chunks.append(txt)
+                                update_document_metrics(document_id, {"ocr_pages_processed": 1}, increment=True)
+                            else:
+                                update_document_metrics(document_id, {"ocr_pages_skipped": 1}, increment=True)
+                        text_content = "\n".join(chunks)
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
+                else:
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    update_document_metrics(document_id, {"ocr_pages_total": 1})
+                    txt, _, ocr_err = extrair_texto_imagem(upload)
+                    if ocr_err:
+                        raise RuntimeError(ocr_err)
+                    text_content = txt
                     if txt:
-                        chunks.append(txt)
-                text_content = "\n".join(chunks)
+                        update_document_metrics(document_id, {"ocr_pages_processed": 1}, increment=True)
+                    else:
+                        update_document_metrics(document_id, {"ocr_pages_skipped": 1}, increment=True)
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
 
-            _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
-            payload = extrair_dados_financeiros(text_content)
-            needs_llm_refine = _is_low_quality_payload(payload)
-            if not payload or needs_llm_refine:
-                motivo = "sem resultado" if not payload else "qualidade baixa"
-                logger.info(
-                    "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
-                    motivo,
+                text_hash = compute_text_hash(text_content)
+                _update_document_fields(document_id, text_uri=text_uri, text_hash=text_hash)
+                save_content_cache(text_hash, "text", text_uri)
+
+            _update_document_fields(document_id, status=STATUS_TEXT_EXTRACTED)
+            doc = _load_doc()
+
+        # STEP 2: STRUCTURED_EXTRACTION
+        if doc["status"] in [STATUS_TEXT_EXTRACTED, STATUS_PROCESSING_EXTRACTION]:
+            _update_document_fields(document_id, status=STATUS_PROCESSING_EXTRACTION, failed_stage=None, error_message=None)
+
+            extraction_uri = doc["extraction_uri"]
+            if not extraction_uri or not os.path.exists(extraction_uri):
+                llm_model = None
+                if ext in [".csv", ".xlsx"]:
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    df_plan, err = processar_planilha(upload)
+                    if err:
+                        raise RuntimeError(err)
+                    result = extract_transactions(df=df_plan)
+                else:
+                    text_uri = doc["text_uri"]
+                    if not text_uri or not os.path.exists(text_uri):
+                        raise RuntimeError("text_uri ausente para etapa de extração")
+                    with open(text_uri, "r", encoding="utf-8") as handler:
+                        text_content = handler.read()
+
+                    regex_result = extract_transactions(text=text_content)
+                    if regex_result.method == "llm":
+                        update_document_metrics(document_id, {"llm_calls": 1}, increment=True)
+                        update_document_metrics(document_id, {"llm_tokens_est": int(len(text_content) / 4) if text_content else 0}, increment=True)
+                    if regex_result.method == "llm" and regex_result.reason and doc["text_hash"]:
+                        cached = _get_llm_cached_payload(doc["text_hash"])
+                        if cached:
+                            cached_payload, _, cached_model = cached
+                            cached_metrics = _compute_extraction_metrics(cached_payload)
+                            result = ExtractionResult(
+                                method="llm",
+                                payload=cached_payload,
+                                metrics=cached_metrics,
+                                reason=f"{regex_result.reason}:llm_cache",
+                            )
+                            llm_model = cached_model
+                            update_document_metrics(document_id, {"llm_cache_hits": 1}, increment=True)
+                        else:
+                            result = regex_result
+                    else:
+                        result = regex_result
+
+                payload = result.payload
+                payload_hash = compute_payload_hash(payload)
+                extraction_uri = os.path.join("data", "artifacts", doc["sha256"], "extraction", "candidate.json")
+                checks_uri = os.path.join("data", "artifacts", doc["sha256"], "extraction", "llm_checks.json")
+                checks = _run_llm_checks(payload)
+                _write_json(extraction_uri, payload)
+                _write_json(checks_uri, checks)
+
+                _update_document_fields(document_id, extraction_uri=extraction_uri, payload_hash=payload_hash)
+                save_content_cache(payload_hash, "payload", extraction_uri)
+                if doc["text_hash"] and result.method == "llm":
+                    _save_llm_cache(doc["text_hash"], extraction_uri, llm_model or "default")
+
+                _record_extraction(
                     document_id,
+                    result.method,
+                    extraction_uri,
+                    result.metrics.confidence,
+                    checks_uri,
+                    metrics=result.metrics,
+                    text_hash=doc["text_hash"],
+                    llm_model=llm_model,
                 )
-                llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                if llm_err and not llm_payload and not payload:
-                    logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
-                    payload = []
-                elif llm_err and payload:
-                    logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
-                elif llm_payload:
-                    payload = llm_payload
-                    extractor = "llm"
-                    logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
-        else:
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            txt, _, ocr_err = extrair_texto_imagem(upload)
-            if ocr_err:
-                raise RuntimeError(ocr_err)
-            text_content = txt
-            _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
-            payload = extrair_dados_financeiros(text_content)
-            needs_llm_refine = _is_low_quality_payload(payload)
-            if not payload or needs_llm_refine:
-                motivo = "sem resultado" if not payload else "qualidade baixa"
-                logger.info(
-                    "[PIPELINE] Regex %s para %s. Iniciando extração/refino via LLM.",
-                    motivo,
-                    document_id,
-                )
-                llm_payload, llm_err = extrair_dados_financeiros_llm(text_content)
-                if llm_err and not llm_payload and not payload:
-                    logger.warning("[PIPELINE] Falha na extração LLM para %s: %s", document_id, llm_err)
-                    payload = []
-                elif llm_err and payload:
-                    logger.warning("[PIPELINE] LLM não refinou %s: %s", document_id, llm_err)
-                elif llm_payload:
-                    payload = llm_payload
-                    extractor = "llm"
-                    logger.info("[PIPELINE] Extração LLM concluída para %s com %s item(ns).", document_id, len(payload))
 
-        payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
-        checks_uri = os.path.join("data", "artifacts", sha, "extraction", "llm_checks.json")
-        checks = _run_llm_checks(payload)
-        _write_json(payload_uri, payload)
-        _write_json(checks_uri, checks)
+            _update_document_fields(document_id, status=STATUS_STRUCTURED_EXTRACTED)
+            doc = _load_doc()
 
-        _save_text_artifact(document_id, sha, "extracted_json", "extraction/candidate.json", json.dumps(payload, ensure_ascii=False), meta={"extractor": extractor})
-        _save_text_artifact(document_id, sha, "llm_checks", "extraction/llm_checks.json", json.dumps(checks, ensure_ascii=False), meta={"extractor": "checks"})
-        _record_extraction(document_id, extractor, payload_uri, checks["confidence"], checks_uri)
-        logger.info(
-            "[PIPELINE] Documento %s processado. extractor=%s payload_items=%s confidence=%.2f",
-            document_id,
-            extractor,
-            len(payload),
-            checks["confidence"],
-        )
+        # STEP 3: REVIEW READY
+        if doc["status"] == STATUS_STRUCTURED_EXTRACTED:
+            _update_document_fields(document_id, status=STATUS_HITL_REVIEW)
+            update_document_metrics(document_id, {"finished_at": _now_iso()})
+            return True, "Pipeline concluída e enviado para HITL_REVIEW."
 
-        _update_ingest_status(document_id, STATUS_LLM_REVIEW)
-        logger.info("[LLM_REVIEW] Documento %s movido para LLM_REVIEW.", document_id)
-        _update_ingest_status(document_id, STATUS_HITL_REVIEW)
-        logger.info("[LLM_REVIEW] Documento %s movido para HITL_REVIEW.", document_id)
-        return True, "Pipeline concluída e enviado para HITL_REVIEW."
+        if doc["status"] == STATUS_HITL_REVIEW:
+            update_document_metrics(document_id, {"finished_at": _now_iso()})
+            return True, "Documento já em HITL_REVIEW."
+
+        return False, f"Status não suportado para processamento: {doc['status']}"
+
     except Exception as exc:
-        _update_ingest_status(document_id, STATUS_ERROR_PROCESSING, str(exc))
-        logger.exception("[PIPELINE] Falha no processamento do documento %s.", document_id)
+        current = _load_doc()
+        failed_stage = "UNKNOWN"
+        if current:
+            if current["status"] in [STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_TEXT_EXTRACTED]:
+                failed_stage = "TEXT_EXTRACTION"
+            elif current["status"] in [STATUS_PROCESSING_EXTRACTION, STATUS_STRUCTURED_EXTRACTED]:
+                failed_stage = "STRUCTURED_EXTRACTION"
+        mark_stage_error(document_id, failed_stage, str(exc))
+        update_document_metrics(document_id, {"finished_at": _now_iso()})
+        logger.exception("[PIPELINE] Falha no processamento checkpointado do documento %s.", document_id)
         return False, str(exc)
 
 
 def process_stored_documents(limit: int = 20) -> Dict[str, int]:
-    docs = list_ingest_documents([STATUS_STORED])[: max(1, int(limit))]
+    docs = list_ingest_documents([STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_TEXT_EXTRACTED, STATUS_PROCESSING_EXTRACTION, STATUS_STRUCTURED_EXTRACTED, STATUS_ERROR_PROCESSING])[: max(1, int(limit))]
     processed = 0
     failed = 0
     for doc in docs:
@@ -847,15 +1451,21 @@ def process_stored_documents(limit: int = 20) -> Dict[str, int]:
     return {"processed": processed, "failed": failed, "found": len(docs)}
 
 
-def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any]]]:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any], str, float, Dict[str, Any]]]:
+    with get_conn(INGEST_DB_NAME) as conn:
         row = conn.execute(
-            "SELECT payload_uri, llm_checks_uri FROM extractions WHERE document_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            """
+            SELECT payload_uri, llm_checks_uri, extractor, confidence, metrics_json
+            FROM extractions
+            WHERE document_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
             (document_id,),
         ).fetchone()
     if not row:
         return None
-    payload_uri, checks_uri = row
+    payload_uri, checks_uri, extractor, confidence, metrics_json = row
     if not os.path.exists(payload_uri):
         return None
     with open(payload_uri, "r", encoding="utf-8") as handler:
@@ -864,11 +1474,19 @@ def get_latest_extraction_payload(document_id: str) -> Optional[Tuple[str, List[
     if checks_uri and os.path.exists(checks_uri):
         with open(checks_uri, "r", encoding="utf-8") as handler:
             checks = json.load(handler)
-    return payload_uri, payload, checks
+
+    metrics = {}
+    if metrics_json:
+        try:
+            metrics = json.loads(metrics_json)
+        except Exception:
+            metrics = {}
+
+    return payload_uri, payload, checks, str(extractor or "unknown"), float(confidence or 0.0), metrics
 
 
 def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_payload: List[Dict[str, Any]], notes: str = "") -> str:
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         row = conn.execute("SELECT sha256 FROM documents WHERE id = ?", (document_id,)).fetchone()
     if not row:
         raise ValueError("Documento não encontrado.")
@@ -876,7 +1494,7 @@ def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_pa
     review_uri = os.path.join("data", "artifacts", sha, "review", "approved.json")
     _write_json(review_uri, edited_payload)
 
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         conn.execute(
             "INSERT INTO reviews (document_id, reviewer, decision, edited_payload_uri, notes) VALUES (?, ?, ?, ?, ?)",
             (document_id, reviewer, decision, review_uri, notes),
@@ -893,9 +1511,9 @@ def submit_hitl_review(document_id: str, reviewer: str, decision: str, edited_pa
 def finalize_document(document_id: str) -> Tuple[bool, str]:
     init_db()
     init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
+    with get_conn(INGEST_DB_NAME) as conn:
         doc = conn.execute(
-            "SELECT id, original_name, status FROM documents WHERE id = ?",
+            "SELECT id, original_name, status, payload_hash FROM documents WHERE id = ?",
             (document_id,),
         ).fetchone()
         review = conn.execute(
@@ -918,6 +1536,13 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
 
     with open(review_uri, "r", encoding="utf-8") as handler:
         payload = json.load(handler)
+
+    payload_hash = doc[3] or compute_payload_hash(payload)
+    update_document_hashes(document_id, payload_hash=payload_hash)
+    existing_payload = find_document_by_payload_hash(payload_hash, exclude_document_id=document_id)
+    if existing_payload and existing_payload["status"] == STATUS_FINALIZED:
+        _update_ingest_status(document_id, STATUS_FINALIZED)
+        return True, f"Finalização pulada: payload idêntico ao documento {existing_payload['id']}."
 
     resumo_tokens = [
         "total",
@@ -969,7 +1594,7 @@ def finalize_document(document_id: str) -> Tuple[bool, str]:
     df = pd.DataFrame(rows)
     insert_transactions(df)
 
-    with sqlite3.connect(DB_NAME) as conn:
+    with get_conn(DB_NAME) as conn:
         total_itens = round(float(df["valor"].sum()), 2)
         total_declarado = round(float(summary_candidates[-1]), 2) if summary_candidates else None
         total_confere = None

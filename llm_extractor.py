@@ -1,17 +1,27 @@
 import json
 import os
+import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MAX_RETRIES = 3
+MAX_RETRIES = int(os.getenv("MAX_LLM_RETRIES", "3"))
+MAX_LLM_CONCURRENCY = int(os.getenv("MAX_LLM_CONCURRENCY", "3"))
+MAX_LLM_RPM = int(os.getenv("MAX_LLM_RPM", "60"))
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 DOCUMENT_TYPES = {"Entrada", "Saída", "Extrato", "Fatura"}
 DEFAULT_DOCUMENT_TYPE = "Extrato"
+llm_sem = threading.Semaphore(max(1, MAX_LLM_CONCURRENCY))
+_rpm_lock = threading.Lock()
+_rpm_window = deque()
+
+
 RECEIPT_MARKERS = [
     "documento aux. da nota fiscal",
     "nota fiscal de consumidor eletr",
@@ -163,21 +173,45 @@ def _post_chat_completion(api_base, api_key, payload, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
+
+
+def _acquire_rpm_slot(rpm: int = MAX_LLM_RPM):
+    rpm = max(1, int(rpm))
+    while True:
+        now = time.time()
+        with _rpm_lock:
+            while _rpm_window and (now - _rpm_window[0]) >= 60:
+                _rpm_window.popleft()
+
+            if len(_rpm_window) < rpm:
+                _rpm_window.append(now)
+                return
+
+            wait_for = max(0.01, 60 - (now - _rpm_window[0]))
+        time.sleep(min(wait_for, 0.5))
+
+
+def _call_llm_controlled(api_base, api_key, payload, timeout=30):
+    _acquire_rpm_slot()
+    with llm_sem:
+        return _post_chat_completion(api_base, api_key, payload, timeout=timeout)
+
+
 def _call_llm_with_retry(api_base, api_key, payload, timeout=30):
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return _post_chat_completion(api_base, api_key, payload, timeout=timeout)
+            return _call_llm_controlled(api_base, api_key, payload, timeout=timeout)
         except urllib.error.HTTPError as exc:
             last_error = exc
             if exc.code in RETRYABLE_HTTP and attempt < MAX_RETRIES:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep((2 ** (attempt - 1)) + random.random() * 0.2)
                 continue
             raise
         except urllib.error.URLError as exc:
             last_error = exc
             if attempt < MAX_RETRIES:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep((2 ** (attempt - 1)) + random.random() * 0.2)
                 continue
             raise
     if last_error:
