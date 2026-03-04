@@ -41,6 +41,7 @@ MIN_ITEMS = 5
 MIN_CONF = 0.70
 MIN_VALUES_RATIO = 0.85
 MIN_DATES_RATIO = 0.70
+MAX_ACTIVE_DOCS = int(os.getenv("MAX_ACTIVE_DOCS", "2"))
 
 logger = logging.getLogger(__name__)
 
@@ -514,6 +515,8 @@ def init_ingest_db():
             conn.execute("ALTER TABLE documents ADD COLUMN extraction_uri TEXT")
         if "failed_stage" not in columns:
             conn.execute("ALTER TABLE documents ADD COLUMN failed_stage TEXT")
+        if "metrics_json" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN metrics_json TEXT")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
@@ -637,7 +640,7 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
         existing = conn.execute(
             """
             SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
-                   created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage
+                   created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json
             FROM documents
             WHERE raw_hash = ? OR sha256 = ?
             ORDER BY updated_at DESC
@@ -664,6 +667,7 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
                 "text_uri": existing[13],
                 "extraction_uri": existing[14],
                 "failed_stage": existing[15],
+                "metrics_json": existing[16],
                 "is_duplicate": True,
             }
 
@@ -686,13 +690,14 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
             None,
             None,
             None,
+            None,
         )
         conn.execute(
             """
             INSERT INTO documents
             (id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
-             created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -714,13 +719,14 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
         "text_uri": None,
         "extraction_uri": None,
         "failed_stage": None,
+        "metrics_json": None,
         "is_duplicate": False,
     }
 
 
 def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     init_ingest_db()
-    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage FROM documents"
+    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage, metrics_json FROM documents"
     params: Tuple[Any, ...] = ()
     if statuses:
         placeholders = ",".join(["?"] * len(statuses))
@@ -749,6 +755,7 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
             "text_uri": row[13],
             "extraction_uri": row[14],
             "failed_stage": row[15],
+            "metrics_json": row[16],
         }
         for row in rows
     ]
@@ -846,6 +853,73 @@ def update_document_hashes(document_id: str, text_hash: Optional[str] = None, pa
             with_tx(conn, _write)
 
     retry_on_lock(_op)
+
+
+def count_processing_docs() -> int:
+    init_ingest_db()
+    statuses = [STATUS_PROCESSING_TEXT, STATUS_PROCESSING_EXTRACTION]
+    placeholders = ",".join(["?"] * len(statuses))
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute(
+            f"SELECT COUNT(1) as total FROM documents WHERE status IN ({placeholders})",
+            tuple(statuses),
+        ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def try_acquire_processing_slot(document_id: str, max_active_docs: Optional[int] = None) -> bool:
+    limit = max_active_docs if max_active_docs is not None else MAX_ACTIVE_DOCS
+    limit = max(1, int(limit))
+
+    def _op() -> bool:
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                active = c.execute(
+                    "SELECT COUNT(1) FROM documents WHERE status IN (?, ?)",
+                    (STATUS_PROCESSING_TEXT, STATUS_PROCESSING_EXTRACTION),
+                ).fetchone()[0]
+                if int(active) >= limit:
+                    return False
+
+                status_row = c.execute("SELECT status FROM documents WHERE id = ?", (document_id,)).fetchone()
+                if not status_row:
+                    return False
+                st = status_row[0]
+                if st in [STATUS_FINALIZED, STATUS_HITL_REVIEW, STATUS_FINALIZE_PENDING]:
+                    return True
+
+                c.execute(
+                    "UPDATE documents SET status = ?, failed_stage = NULL, error_message = NULL, updated_at = ? WHERE id = ?",
+                    (STATUS_PROCESSING_TEXT, _now_iso(), document_id),
+                )
+                return True
+
+            return bool(with_tx(conn, _write))
+
+    return bool(retry_on_lock(_op))
+
+
+def _load_document_metrics(document_id: str) -> Dict[str, Any]:
+    with get_conn(INGEST_DB_NAME) as conn:
+        row = conn.execute("SELECT metrics_json FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def update_document_metrics(document_id: str, updates: Dict[str, Any], increment: bool = False) -> None:
+    metrics = _load_document_metrics(document_id)
+    for k, v in updates.items():
+        if increment and isinstance(v, (int, float)):
+            metrics[k] = float(metrics.get(k, 0)) + float(v)
+        else:
+            metrics[k] = v
+    _update_document_fields(document_id, metrics_json=json.dumps(metrics, ensure_ascii=False))
 
 
 def find_document_by_text_hash(text_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -1205,6 +1279,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
     ext = os.path.splitext(str(doc["original_name"]).lower())[1]
 
     try:
+        update_document_metrics(document_id, {"started_at": _now_iso(), "worker_id": os.getenv("WORKER_ID", "worker")})
         doc = _load_doc()
 
         # STEP 1: TEXT_EXTRACTION
@@ -1233,6 +1308,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                         if err_img:
                             raise RuntimeError(err_img)
                         chunks = []
+                        update_document_metrics(document_id, {"ocr_pages_total": len(imgs)})
                         for idx, img_buffer in enumerate(imgs, start=1):
                             img_bytes = img_buffer.getvalue()
                             _save_artifact(document_id, doc["sha256"], "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
@@ -1240,15 +1316,23 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                             txt, _, _ = extrair_texto_imagem(img_buffer)
                             if txt:
                                 chunks.append(txt)
+                                update_document_metrics(document_id, {"ocr_pages_processed": 1}, increment=True)
+                            else:
+                                update_document_metrics(document_id, {"ocr_pages_skipped": 1}, increment=True)
                         text_content = "\n".join(chunks)
                     text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
                     _write_bytes(text_uri, text_content.encode("utf-8"))
                 else:
                     upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    update_document_metrics(document_id, {"ocr_pages_total": 1})
                     txt, _, ocr_err = extrair_texto_imagem(upload)
                     if ocr_err:
                         raise RuntimeError(ocr_err)
                     text_content = txt
+                    if txt:
+                        update_document_metrics(document_id, {"ocr_pages_processed": 1}, increment=True)
+                    else:
+                        update_document_metrics(document_id, {"ocr_pages_skipped": 1}, increment=True)
                     text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
                     _write_bytes(text_uri, text_content.encode("utf-8"))
 
@@ -1280,6 +1364,9 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                         text_content = handler.read()
 
                     regex_result = extract_transactions(text=text_content)
+                    if regex_result.method == "llm":
+                        update_document_metrics(document_id, {"llm_calls": 1}, increment=True)
+                        update_document_metrics(document_id, {"llm_tokens_est": int(len(text_content) / 4) if text_content else 0}, increment=True)
                     if regex_result.method == "llm" and regex_result.reason and doc["text_hash"]:
                         cached = _get_llm_cached_payload(doc["text_hash"])
                         if cached:
@@ -1292,6 +1379,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
                                 reason=f"{regex_result.reason}:llm_cache",
                             )
                             llm_model = cached_model
+                            update_document_metrics(document_id, {"llm_cache_hits": 1}, increment=True)
                         else:
                             result = regex_result
                     else:
@@ -1327,9 +1415,11 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
         # STEP 3: REVIEW READY
         if doc["status"] == STATUS_STRUCTURED_EXTRACTED:
             _update_document_fields(document_id, status=STATUS_HITL_REVIEW)
+            update_document_metrics(document_id, {"finished_at": _now_iso()})
             return True, "Pipeline concluída e enviado para HITL_REVIEW."
 
         if doc["status"] == STATUS_HITL_REVIEW:
+            update_document_metrics(document_id, {"finished_at": _now_iso()})
             return True, "Documento já em HITL_REVIEW."
 
         return False, f"Status não suportado para processamento: {doc['status']}"
@@ -1343,6 +1433,7 @@ def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
             elif current["status"] in [STATUS_PROCESSING_EXTRACTION, STATUS_STRUCTURED_EXTRACTED]:
                 failed_stage = "STRUCTURED_EXTRACTION"
         mark_stage_error(document_id, failed_stage, str(exc))
+        update_document_metrics(document_id, {"finished_at": _now_iso()})
         logger.exception("[PIPELINE] Falha no processamento checkpointado do documento %s.", document_id)
         return False, str(exc)
 
