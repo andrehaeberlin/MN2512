@@ -24,6 +24,50 @@ def _resize_max(img_np: np.ndarray, max_w: int = 1800) -> np.ndarray:
     return cv2.resize(img_np, (max_w, nh), interpolation=cv2.INTER_AREA)
 
 
+def is_blank_or_low_density(image: np.ndarray, threshold: float = 0.02) -> bool:
+    """Detecta páginas com baixa densidade de tinta (potencialmente irrelevantes)."""
+    if image.size == 0:
+        return True
+
+    if len(image.shape) == 2:
+        gray = image
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    ink_pixels = int(np.sum(binary == 255))
+    total_pixels = int(binary.size) or 1
+    density = ink_pixels / total_pixels
+    return density < threshold
+
+
+def crop_roi(image: np.ndarray, top_ratio: float = 0.1, bottom_ratio: float = 0.1, side_ratio: float = 0.05) -> np.ndarray:
+    """Recorta margens superior/inferior/laterais para focar na região útil."""
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return image
+
+    top = int(h * top_ratio)
+    bottom = int(h * (1 - bottom_ratio))
+    left = int(w * side_ratio)
+    right = int(w * (1 - side_ratio))
+
+    if top >= bottom or left >= right:
+        return image
+    return image[top:bottom, left:right]
+
+
+def normalize_scale(image: np.ndarray, target_width: int = 1600) -> np.ndarray:
+    """Padroniza largura máxima para reduzir custo mantendo legibilidade."""
+    h, w = image.shape[:2]
+    if w <= target_width or w == 0 or h == 0:
+        return image
+
+    scale_ratio = target_width / float(w)
+    new_height = max(1, int(h * scale_ratio))
+    return cv2.resize(image, (target_width, new_height), interpolation=cv2.INTER_AREA)
+
+
 def preprocessar_imagem_ocr(img_np: np.ndarray) -> np.ndarray:
     """Aplica pré-processamento amigável para OCR de recibos/notas."""
     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
@@ -65,6 +109,15 @@ def extrair_texto_imagem(arquivo_imagem, idiomas: Sequence[str] = ("pt", "en"), 
         img_pil = img_pil.convert("RGB")
 
         img_np = np.array(img_pil)
+
+        if is_blank_or_low_density(img_np):
+            tempo_total = time.time() - inicio
+            nome_arquivo = getattr(arquivo_imagem, "name", "BytesIO")
+            print(f"[OCR] Arquivo: {nome_arquivo} | Tempo: {tempo_total:.2f}s | Página ignorada por baixa densidade")
+            return "", tempo_total, None
+
+        img_np = crop_roi(img_np)
+        img_np = normalize_scale(img_np, target_width=1600)
         img_np = _resize_max(img_np, max_w=1800)
 
         reader = obter_leitor_ocr(tuple(idiomas), gpu=gpu)
