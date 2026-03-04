@@ -23,13 +23,19 @@ DB_NAME = "dados_financeiros.db"
 INGEST_DB_NAME = "ingestao.db"
 
 STATUS_STORED = "STORED"
-STATUS_PROCESSING = "PROCESSING"
-STATUS_LLM_REVIEW = "LLM_REVIEW"
+STATUS_PROCESSING_TEXT = "PROCESSING_TEXT"
+STATUS_TEXT_EXTRACTED = "TEXT_EXTRACTED"
+STATUS_PROCESSING_EXTRACTION = "PROCESSING_EXTRACTION"
+STATUS_STRUCTURED_EXTRACTED = "STRUCTURED_EXTRACTED"
 STATUS_HITL_REVIEW = "HITL_REVIEW"
 STATUS_FINALIZE_PENDING = "FINALIZE_PENDING"
 STATUS_FINALIZED = "FINALIZED"
 STATUS_ERROR_STORAGE = "ERROR_STORAGE"
 STATUS_ERROR_PROCESSING = "ERROR_PROCESSING"
+
+# Compatibilidade legada
+STATUS_PROCESSING = STATUS_PROCESSING_TEXT
+STATUS_LLM_REVIEW = STATUS_STRUCTURED_EXTRACTED
 
 MIN_ITEMS = 5
 MIN_CONF = 0.70
@@ -502,29 +508,12 @@ def init_ingest_db():
             conn.execute("ALTER TABLE documents ADD COLUMN text_hash TEXT")
         if "payload_hash" not in columns:
             conn.execute("ALTER TABLE documents ADD COLUMN payload_hash TEXT")
-
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_payload_hash ON documents(payload_hash);")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS content_cache (
-                hash TEXT PRIMARY KEY,
-                type TEXT NOT NULL,
-                uri TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            """
-        )
-
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
-        if "raw_hash" not in columns:
-            conn.execute("ALTER TABLE documents ADD COLUMN raw_hash TEXT")
-        if "text_hash" not in columns:
-            conn.execute("ALTER TABLE documents ADD COLUMN text_hash TEXT")
-        if "payload_hash" not in columns:
-            conn.execute("ALTER TABLE documents ADD COLUMN payload_hash TEXT")
+        if "text_uri" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN text_uri TEXT")
+        if "extraction_uri" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN extraction_uri TEXT")
+        if "failed_stage" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN failed_stage TEXT")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_raw_hash ON documents(raw_hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_text_hash ON documents(text_hash);")
@@ -648,7 +637,7 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
         existing = conn.execute(
             """
             SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
-                   created_at, updated_at, raw_hash, text_hash, payload_hash
+                   created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage
             FROM documents
             WHERE raw_hash = ? OR sha256 = ?
             ORDER BY updated_at DESC
@@ -672,6 +661,9 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
                 "raw_hash": existing[10],
                 "text_hash": existing[11],
                 "payload_hash": existing[12],
+                "text_uri": existing[13],
+                "extraction_uri": existing[14],
+                "failed_stage": existing[15],
                 "is_duplicate": True,
             }
 
@@ -691,13 +683,16 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
             raw_hash,
             None,
             None,
+            None,
+            None,
+            None,
         )
         conn.execute(
             """
             INSERT INTO documents
             (id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message,
-             created_at, updated_at, raw_hash, text_hash, payload_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )
@@ -716,13 +711,16 @@ def store_raw_document(file_name: str, mime: str, file_bytes: bytes, storage_roo
         "raw_hash": raw_hash,
         "text_hash": None,
         "payload_hash": None,
+        "text_uri": None,
+        "extraction_uri": None,
+        "failed_stage": None,
         "is_duplicate": False,
     }
 
 
 def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     init_ingest_db()
-    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at, raw_hash, text_hash, payload_hash FROM documents"
+    query = "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, error_message, created_at, updated_at, raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage FROM documents"
     params: Tuple[Any, ...] = ()
     if statuses:
         placeholders = ",".join(["?"] * len(statuses))
@@ -748,6 +746,9 @@ def list_ingest_documents(statuses: Optional[List[str]] = None) -> List[Dict[str
             "raw_hash": row[10],
             "text_hash": row[11],
             "payload_hash": row[12],
+            "text_uri": row[13],
+            "extraction_uri": row[14],
+            "failed_stage": row[15],
         }
         for row in rows
     ]
@@ -773,6 +774,54 @@ def update_document_status(document_id: str, status: str, error_message: Optiona
     """Atualiza status de um documento na fila de ingestão."""
     init_ingest_db()
     _update_ingest_status(str(document_id), status, error_message)
+
+
+def _update_document_fields(document_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+
+    init_ingest_db()
+
+    def _op():
+        with get_conn(INGEST_DB_NAME) as conn:
+            apply_sqlite_pragmas(conn)
+
+            def _write(c):
+                payload = dict(fields)
+                payload["updated_at"] = _now_iso()
+                assignments = ", ".join([f"{k} = ?" for k in payload.keys()])
+                values = list(payload.values()) + [document_id]
+                c.execute(f"UPDATE documents SET {assignments} WHERE id = ?", values)
+
+            with_tx(conn, _write)
+
+    retry_on_lock(_op)
+
+
+def mark_stage_error(document_id: str, failed_stage: str, error_message: str) -> None:
+    _update_document_fields(
+        document_id,
+        status=STATUS_ERROR_PROCESSING,
+        failed_stage=failed_stage,
+        error_message=error_message,
+    )
+
+
+def reset_document_to_stage(document_id: str, stage: str) -> None:
+    allowed = {
+        STATUS_STORED,
+        STATUS_TEXT_EXTRACTED,
+        STATUS_STRUCTURED_EXTRACTED,
+    }
+    if stage not in allowed:
+        raise ValueError(f"Stage inválido para reset: {stage}")
+
+    _update_document_fields(
+        document_id,
+        status=stage,
+        failed_stage=None,
+        error_message=None,
+    )
 
 
 def update_document_hashes(document_id: str, text_hash: Optional[str] = None, payload_hash: Optional[str] = None) -> None:
@@ -852,86 +901,6 @@ def find_document_by_payload_hash(payload_hash: str, exclude_document_id: Option
 def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
     init_ingest_db()
     with get_conn(INGEST_DB_NAME) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO content_cache (hash, type, uri) VALUES (?, ?, ?)",
-            (content_hash, content_type, uri),
-        )
-
-
-def update_document_status(document_id: str, status: str, error_message: Optional[str] = None) -> None:
-    """Atualiza status de um documento na fila de ingestão."""
-    init_ingest_db()
-    _update_ingest_status(str(document_id), status, error_message)
-
-
-def update_document_hashes(document_id: str, text_hash: Optional[str] = None, payload_hash: Optional[str] = None) -> None:
-    init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        if text_hash is not None:
-            conn.execute(
-                "UPDATE documents SET text_hash = ?, updated_at = ? WHERE id = ?",
-                (text_hash, _now_iso(), document_id),
-            )
-        if payload_hash is not None:
-            conn.execute(
-                "UPDATE documents SET payload_hash = ?, updated_at = ? WHERE id = ?",
-                (payload_hash, _now_iso(), document_id),
-            )
-
-
-def find_document_by_text_hash(text_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    init_ingest_db()
-    where = "WHERE text_hash = ?"
-    params: List[Any] = [text_hash]
-    if exclude_document_id:
-        where += " AND id <> ?"
-        params.append(exclude_document_id)
-
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        row = conn.execute(
-            f"""
-            SELECT id, status, payload_hash
-            FROM documents
-            {where}
-            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 1
-            """,
-            (*params, STATUS_FINALIZED),
-        ).fetchone()
-
-    if not row:
-        return None
-    return {"id": row[0], "status": row[1], "payload_hash": row[2]}
-
-
-def find_document_by_payload_hash(payload_hash: str, exclude_document_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    init_ingest_db()
-    where = "WHERE payload_hash = ?"
-    params: List[Any] = [payload_hash]
-    if exclude_document_id:
-        where += " AND id <> ?"
-        params.append(exclude_document_id)
-
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
-        row = conn.execute(
-            f"""
-            SELECT id, status
-            FROM documents
-            {where}
-            ORDER BY CASE WHEN status = ? THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 1
-            """,
-            (*params, STATUS_FINALIZED),
-        ).fetchone()
-
-    if not row:
-        return None
-    return {"id": row[0], "status": row[1]}
-
-
-def save_content_cache(content_hash: str, content_type: str, uri: str) -> None:
-    init_ingest_db()
-    with sqlite3.connect(INGEST_DB_NAME) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO content_cache (hash, type, uri) VALUES (?, ?, ?)",
             (content_hash, content_type, uri),
@@ -1023,10 +992,6 @@ def _requires_llm(metrics: ExtractionMetrics) -> Optional[str]:
         return "low_dates_ratio"
     return None
 
-    with open(payload_uri, "r", encoding="utf-8") as handler:
-        payload = json.load(handler)
-    if not isinstance(payload, list):
-        return None
 
 def _save_llm_cache(text_hash: str, payload_uri: str, llm_model: str = "default") -> None:
     init_ingest_db()
@@ -1193,165 +1158,197 @@ def _record_extraction(
 
 def run_pipeline_for_document(document_id: str) -> Tuple[bool, str]:
     init_ingest_db()
-    with get_conn(INGEST_DB_NAME) as conn:
-        doc = conn.execute(
-            "SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status, raw_hash, text_hash, payload_hash FROM documents WHERE id = ?",
-            (document_id,),
-        ).fetchone()
 
+    def _load_doc() -> Optional[sqlite3.Row]:
+        with get_conn(INGEST_DB_NAME) as conn:
+            return conn.execute(
+                """
+                SELECT id, sha256, original_name, mime, size_bytes, storage_uri_raw, status,
+                       raw_hash, text_hash, payload_hash, text_uri, extraction_uri, failed_stage
+                FROM documents
+                WHERE id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+
+    doc = _load_doc()
     if not doc:
         return False, "Documento não encontrado na ingestão."
 
-    _, sha, original_name, mime, _, raw_uri, status, raw_hash, _, _ = doc
-    if status == STATUS_FINALIZED:
+    if doc["status"] == STATUS_FINALIZED:
         return True, "Documento já finalizado (idempotente)."
-    if status != STATUS_STORED:
-        return False, f"Documento {document_id} não está em STORED."
+    if doc["status"] in [STATUS_HITL_REVIEW, STATUS_FINALIZE_PENDING]:
+        return True, f"Documento já está em {doc['status']}."
 
+    raw_uri = doc["storage_uri_raw"]
     if not os.path.exists(raw_uri):
-        _update_ingest_status(document_id, STATUS_ERROR_STORAGE, "Arquivo raw não encontrado")
+        _update_document_fields(document_id, status=STATUS_ERROR_STORAGE, error_message="Arquivo raw não encontrado", failed_stage="RAW_VALIDATE")
         return False, "Arquivo raw não encontrado."
 
     with open(raw_uri, "rb") as handler:
         raw_bytes = handler.read()
 
-    if _sha256_bytes(raw_bytes) != sha:
-        _update_ingest_status(document_id, STATUS_ERROR_STORAGE, "SHA256 divergente do raw")
+    if _sha256_bytes(raw_bytes) != doc["sha256"]:
+        _update_document_fields(document_id, status=STATUS_ERROR_STORAGE, error_message="SHA256 divergente do raw", failed_stage="RAW_VALIDATE")
         return False, "SHA divergente do raw."
 
     current_raw_hash = compute_raw_hash(raw_bytes)
-    if raw_hash != current_raw_hash:
-        with get_conn(INGEST_DB_NAME) as conn:
-            conn.execute(
-                "UPDATE documents SET raw_hash = ?, updated_at = ? WHERE id = ?",
-                (current_raw_hash, _now_iso(), document_id),
-            )
+    if doc["raw_hash"] != current_raw_hash:
+        _update_document_fields(document_id, raw_hash=current_raw_hash)
 
-    _update_ingest_status(document_id, STATUS_PROCESSING)
-    logger.info("[PIPELINE] Documento %s (%s) movido para PROCESSING.", document_id, original_name)
+    class _UploadWrap(io.BytesIO):
+        def __init__(self, data: bytes, name: str, mime_type: str):
+            super().__init__(data)
+            self.name = name
+            self.type = mime_type
+
+    ext = os.path.splitext(str(doc["original_name"]).lower())[1]
 
     try:
-        text_content = ""
-        text_hash = None
-        llm_model = None
-        ext = os.path.splitext(original_name.lower())[1]
+        doc = _load_doc()
 
-        class _UploadWrap(io.BytesIO):
-            def __init__(self, data: bytes, name: str, mime_type: str):
-                super().__init__(data)
-                self.name = name
-                self.type = mime_type
+        # STEP 1: TEXT_EXTRACTION
+        if doc["status"] in [STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_ERROR_PROCESSING]:
+            _update_document_fields(document_id, status=STATUS_PROCESSING_TEXT, failed_stage=None, error_message=None)
 
-        payload = []
-        checks = {}
-        payload_reused = False
-
-        if ext in [".csv", ".xlsx"]:
-            upload = _UploadWrap(raw_bytes, original_name, mime)
-            df_plan, err = processar_planilha(upload)
-            if err:
-                raise RuntimeError(err)
-            result = extract_transactions(df=df_plan)
-        else:
-            if ext == ".pdf":
-                upload = _UploadWrap(raw_bytes, original_name, mime)
-                text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
-                if err_pdf:
-                    raise RuntimeError(err_pdf)
-                text_content = text_pdf
-                if is_scanned:
-                    upload.seek(0)
-                    imgs, err_img = converter_pdf_para_imagens(upload)
-                    if err_img:
-                        raise RuntimeError(err_img)
-                    chunks = []
-                    for idx, img_buffer in enumerate(imgs, start=1):
-                        img_bytes = img_buffer.getvalue()
-                        _save_artifact(document_id, sha, "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
-                        img_buffer.seek(0)
-                        txt, _, _ = extrair_texto_imagem(img_buffer)
-                        if txt:
-                            chunks.append(txt)
-                    text_content = "\n".join(chunks)
-                _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "pdf"})
-            else:
-                upload = _UploadWrap(raw_bytes, original_name, mime)
-                txt, _, ocr_err = extrair_texto_imagem(upload)
-                if ocr_err:
-                    raise RuntimeError(ocr_err)
-                text_content = txt
-                _save_text_artifact(document_id, sha, "ocr_text", "ocr/text.txt", text_content, meta={"source": "image"})
-
-            text_hash = compute_text_hash(text_content)
-            update_document_hashes(document_id, text_hash=text_hash)
-            save_content_cache(text_hash, "text", os.path.join("data", "artifacts", sha, "ocr", "text.txt"))
-
-            regex_result = extract_transactions(text=text_content)
-            if regex_result.method == "llm" and regex_result.reason:
-                cached = _get_llm_cached_payload(text_hash)
-                if cached:
-                    cached_payload, _, cached_model = cached
-                    cached_metrics = _compute_extraction_metrics(cached_payload)
-                    result = ExtractionResult(
-                        method="llm",
-                        payload=cached_payload,
-                        metrics=cached_metrics,
-                        reason=f"{regex_result.reason}:llm_cache",
-                    )
-                    llm_model = cached_model
-                    logger.info("[PIPELINE] LLM cache hit para text_hash=%s", text_hash)
+            text_uri = doc["text_uri"]
+            if not text_uri or not os.path.exists(text_uri):
+                if ext in [".csv", ".xlsx"]:
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    df_plan, err = processar_planilha(upload)
+                    if err:
+                        raise RuntimeError(err)
+                    text_content = df_plan.to_csv(index=False)
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
+                elif ext == ".pdf":
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    text_pdf, is_scanned, err_pdf = extrair_texto_pdf(upload)
+                    if err_pdf:
+                        raise RuntimeError(err_pdf)
+                    text_content = text_pdf
+                    if is_scanned:
+                        upload.seek(0)
+                        imgs, err_img = converter_pdf_para_imagens(upload)
+                        if err_img:
+                            raise RuntimeError(err_img)
+                        chunks = []
+                        for idx, img_buffer in enumerate(imgs, start=1):
+                            img_bytes = img_buffer.getvalue()
+                            _save_artifact(document_id, doc["sha256"], "pdf_page_image", f"pdf_pages/page-{idx:03d}.png", img_bytes, meta={"page": idx})
+                            img_buffer.seek(0)
+                            txt, _, _ = extrair_texto_imagem(img_buffer)
+                            if txt:
+                                chunks.append(txt)
+                        text_content = "\n".join(chunks)
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
                 else:
-                    result = regex_result
-            else:
-                result = regex_result
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    txt, _, ocr_err = extrair_texto_imagem(upload)
+                    if ocr_err:
+                        raise RuntimeError(ocr_err)
+                    text_content = txt
+                    text_uri = os.path.join("data", "artifacts", doc["sha256"], "ocr", "text.txt")
+                    _write_bytes(text_uri, text_content.encode("utf-8"))
 
-        payload = result.payload
-        payload_hash = compute_payload_hash(payload)
-        update_document_hashes(document_id, payload_hash=payload_hash)
+                text_hash = compute_text_hash(text_content)
+                _update_document_fields(document_id, text_uri=text_uri, text_hash=text_hash)
+                save_content_cache(text_hash, "text", text_uri)
 
-        payload_uri = os.path.join("data", "artifacts", sha, "extraction", "candidate.json")
-        checks_uri = os.path.join("data", "artifacts", sha, "extraction", "llm_checks.json")
-        if not checks:
-            checks = _run_llm_checks(payload)
-        _write_json(payload_uri, payload)
-        _write_json(checks_uri, checks)
-        save_content_cache(payload_hash, "payload", payload_uri)
+            _update_document_fields(document_id, status=STATUS_TEXT_EXTRACTED)
+            doc = _load_doc()
 
-        if text_hash and result.method == "llm":
-            _save_llm_cache(text_hash, payload_uri, llm_model or "default")
+        # STEP 2: STRUCTURED_EXTRACTION
+        if doc["status"] in [STATUS_TEXT_EXTRACTED, STATUS_PROCESSING_EXTRACTION]:
+            _update_document_fields(document_id, status=STATUS_PROCESSING_EXTRACTION, failed_stage=None, error_message=None)
 
-        _save_text_artifact(document_id, sha, "extracted_json", "extraction/candidate.json", json.dumps(payload, ensure_ascii=False), meta={"extractor": result.method, "reason": result.reason})
-        _save_text_artifact(document_id, sha, "llm_checks", "extraction/llm_checks.json", json.dumps(checks, ensure_ascii=False), meta={"extractor": "checks"})
-        _record_extraction(
-            document_id,
-            result.method,
-            payload_uri,
-            result.metrics.confidence,
-            checks_uri,
-            metrics=result.metrics,
-            text_hash=text_hash,
-            llm_model=llm_model,
-        )
-        logger.info(
-            "[PIPELINE] Documento %s processado. extractor=%s payload_items=%s confidence=%.2f reason=%s",
-            document_id,
-            result.method,
-            len(payload),
-            result.metrics.confidence,
-            result.reason,
-        )
+            extraction_uri = doc["extraction_uri"]
+            if not extraction_uri or not os.path.exists(extraction_uri):
+                llm_model = None
+                if ext in [".csv", ".xlsx"]:
+                    upload = _UploadWrap(raw_bytes, doc["original_name"], doc["mime"])
+                    df_plan, err = processar_planilha(upload)
+                    if err:
+                        raise RuntimeError(err)
+                    result = extract_transactions(df=df_plan)
+                else:
+                    text_uri = doc["text_uri"]
+                    if not text_uri or not os.path.exists(text_uri):
+                        raise RuntimeError("text_uri ausente para etapa de extração")
+                    with open(text_uri, "r", encoding="utf-8") as handler:
+                        text_content = handler.read()
 
-        _update_ingest_status(document_id, STATUS_LLM_REVIEW)
-        _update_ingest_status(document_id, STATUS_HITL_REVIEW)
-        return True, "Pipeline concluída e enviado para HITL_REVIEW."
+                    regex_result = extract_transactions(text=text_content)
+                    if regex_result.method == "llm" and regex_result.reason and doc["text_hash"]:
+                        cached = _get_llm_cached_payload(doc["text_hash"])
+                        if cached:
+                            cached_payload, _, cached_model = cached
+                            cached_metrics = _compute_extraction_metrics(cached_payload)
+                            result = ExtractionResult(
+                                method="llm",
+                                payload=cached_payload,
+                                metrics=cached_metrics,
+                                reason=f"{regex_result.reason}:llm_cache",
+                            )
+                            llm_model = cached_model
+                        else:
+                            result = regex_result
+                    else:
+                        result = regex_result
+
+                payload = result.payload
+                payload_hash = compute_payload_hash(payload)
+                extraction_uri = os.path.join("data", "artifacts", doc["sha256"], "extraction", "candidate.json")
+                checks_uri = os.path.join("data", "artifacts", doc["sha256"], "extraction", "llm_checks.json")
+                checks = _run_llm_checks(payload)
+                _write_json(extraction_uri, payload)
+                _write_json(checks_uri, checks)
+
+                _update_document_fields(document_id, extraction_uri=extraction_uri, payload_hash=payload_hash)
+                save_content_cache(payload_hash, "payload", extraction_uri)
+                if doc["text_hash"] and result.method == "llm":
+                    _save_llm_cache(doc["text_hash"], extraction_uri, llm_model or "default")
+
+                _record_extraction(
+                    document_id,
+                    result.method,
+                    extraction_uri,
+                    result.metrics.confidence,
+                    checks_uri,
+                    metrics=result.metrics,
+                    text_hash=doc["text_hash"],
+                    llm_model=llm_model,
+                )
+
+            _update_document_fields(document_id, status=STATUS_STRUCTURED_EXTRACTED)
+            doc = _load_doc()
+
+        # STEP 3: REVIEW READY
+        if doc["status"] == STATUS_STRUCTURED_EXTRACTED:
+            _update_document_fields(document_id, status=STATUS_HITL_REVIEW)
+            return True, "Pipeline concluída e enviado para HITL_REVIEW."
+
+        if doc["status"] == STATUS_HITL_REVIEW:
+            return True, "Documento já em HITL_REVIEW."
+
+        return False, f"Status não suportado para processamento: {doc['status']}"
+
     except Exception as exc:
-        _update_ingest_status(document_id, STATUS_ERROR_PROCESSING, str(exc))
-        logger.exception("[PIPELINE] Falha no processamento do documento %s.", document_id)
+        current = _load_doc()
+        failed_stage = "UNKNOWN"
+        if current:
+            if current["status"] in [STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_TEXT_EXTRACTED]:
+                failed_stage = "TEXT_EXTRACTION"
+            elif current["status"] in [STATUS_PROCESSING_EXTRACTION, STATUS_STRUCTURED_EXTRACTED]:
+                failed_stage = "STRUCTURED_EXTRACTION"
+        mark_stage_error(document_id, failed_stage, str(exc))
+        logger.exception("[PIPELINE] Falha no processamento checkpointado do documento %s.", document_id)
         return False, str(exc)
 
 
 def process_stored_documents(limit: int = 20) -> Dict[str, int]:
-    docs = list_ingest_documents([STATUS_STORED])[: max(1, int(limit))]
+    docs = list_ingest_documents([STATUS_STORED, STATUS_PROCESSING_TEXT, STATUS_TEXT_EXTRACTED, STATUS_PROCESSING_EXTRACTION, STATUS_STRUCTURED_EXTRACTED, STATUS_ERROR_PROCESSING])[: max(1, int(limit))]
     processed = 0
     failed = 0
     for doc in docs:
