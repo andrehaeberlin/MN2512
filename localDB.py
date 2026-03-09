@@ -1,17 +1,18 @@
 import hashlib
 import io
 import json
-from dataclasses import asdict, dataclass
 import logging
 import random
 import os
 import sqlite3
 import uuid
 import time
+import pandas as pd
+
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
-
-import pandas as pd
+from contextlib import contextmanager
 from extrator_regex import extrair_dados_financeiros
 from llm_extractor import extrair_dados_financeiros_llm
 from ocr import extrair_texto_imagem
@@ -72,8 +73,8 @@ class ExtractionResult:
 
 
 
-
-def get_conn(db_path: str) -> sqlite3.Connection:
+@contextmanager
+def get_conn(db_path: str):
     conn = sqlite3.connect(
         db_path,
         timeout=30,
@@ -81,7 +82,13 @@ def get_conn(db_path: str) -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
@@ -876,29 +883,37 @@ def try_acquire_processing_slot(document_id: str, max_active_docs: Optional[int]
             apply_sqlite_pragmas(conn)
 
             def _write(c):
-                active = c.execute(
-                    "SELECT COUNT(1) FROM documents WHERE status IN (?, ?)",
-                    (STATUS_PROCESSING_TEXT, STATUS_PROCESSING_EXTRACTION),
-                ).fetchone()[0]
-                if int(active) >= limit:
-                    return False
-
-                status_row = c.execute("SELECT status FROM documents WHERE id = ?", (document_id,)).fetchone()
-                if not status_row:
-                    return False
-                st = status_row[0]
-                if st in [STATUS_FINALIZED, STATUS_HITL_REVIEW, STATUS_FINALIZE_PENDING]:
-                    return True
-
-                c.execute(
-                    "UPDATE documents SET status = ?, failed_stage = NULL, error_message = NULL, updated_at = ? WHERE id = ?",
-                    (STATUS_PROCESSING_TEXT, _now_iso(), document_id),
+                res = c.execute(
+                    """
+                    UPDATE documents
+                    SET status = ?, failed_stage = NULL, error_message = NULL, updated_at = ?
+                    WHERE id = ?
+                    AND status NOT IN (?, ?, ?)
+                    AND (
+                        SELECT COUNT(1)
+                        FROM documents
+                        WHERE status IN (?, ?)
+                    ) < ?
+                    """,
+                    (
+                        STATUS_PROCESSING_TEXT,
+                        _now_iso(),
+                        document_id,
+                        STATUS_FINALIZED,
+                        STATUS_HITL_REVIEW,
+                        STATUS_FINALIZE_PENDING,
+                        STATUS_PROCESSING_TEXT,
+                        STATUS_PROCESSING_EXTRACTION,
+                        limit,
+                    ),
                 )
-                return True
+
+                return res.rowcount > 0
 
             return bool(with_tx(conn, _write))
 
     return bool(retry_on_lock(_op))
+
 
 
 def _load_document_metrics(document_id: str) -> Dict[str, Any]:
